@@ -3,3 +3,4 @@ pdfplumber
 pymupdf
 rapidfuzz
 pandas
+openpyxl
