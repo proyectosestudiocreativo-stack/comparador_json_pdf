@@ -5,10 +5,16 @@ import pandas as pd
 import re
 from io import BytesIO
 
-st.set_page_config(page_title="Comparador JSON vs PDF", layout="wide")
+st.set_page_config(page_title="Comparador PDF vs JSON", layout="wide")
 
-st.title("Comparador JSON vs PDF")
-st.write("Sube un archivo JSON y un archivo PDF para detectar solo las diferencias entre uno y otro.")
+st.markdown("""
+<style>
+.semaforo-verde    { background:#1a472a; color:#a9f5c0; padding:18px 24px; border-radius:12px; font-size:22px; font-weight:bold; text-align:center; margin-bottom:10px; }
+.semaforo-amarillo { background:#7a6000; color:#ffe680; padding:18px 24px; border-radius:12px; font-size:22px; font-weight:bold; text-align:center; margin-bottom:10px; }
+.semaforo-rojo     { background:#6b1a1a; color:#ffaaaa; padding:18px 24px; border-radius:12px; font-size:22px; font-weight:bold; text-align:center; margin-bottom:10px; }
+.sin-pareja        { background:#3a2000; color:#ffcc80; padding:10px 16px; border-radius:8px; margin-bottom:6px; font-size:14px; }
+</style>
+""", unsafe_allow_html=True)
 
 
 # =========================================================
@@ -20,10 +26,8 @@ def limpiar_texto(txt):
         return ""
     return str(txt).strip()
 
-
 def limpiar_upper(txt):
     return limpiar_texto(txt).upper()
-
 
 def convertir_a_float(valor):
     try:
@@ -32,13 +36,11 @@ def convertir_a_float(valor):
     except:
         return None
 
-
 def a_euro(valor):
     num = convertir_a_float(valor)
     if num is None:
         return ""
     return f"{num:.2f} €"
-
 
 def crear_excel_en_memoria(df):
     output = BytesIO()
@@ -47,171 +49,135 @@ def crear_excel_en_memoria(df):
     output.seek(0)
     return output.getvalue()
 
+def son_textos_distintos(a, b):
+    return limpiar_upper(a) != limpiar_upper(b)
+
+def son_numeros_distintos(a, b):
+    fa = convertir_a_float(a)
+    fb = convertir_a_float(b)
+    if fa is None and fb is None:
+        return False
+    if fa is None or fb is None:
+        return True
+    return fa != fb
+
 
 # =========================================================
-# JSON
+# PARSEAR JSON
 # =========================================================
 
 def parsear_json(data):
     resumen = {
-        "cliente": limpiar_texto(data.get("customerName", "")),
-        "pedido": limpiar_texto(data.get("orderCode", "")),
-        "tienda": limpiar_texto(data.get("storeName", "")),
+        "pedido":   limpiar_texto(data.get("orderCode", "")),
+        "cliente":  limpiar_texto(data.get("customerName", "")),
+        "tienda":   limpiar_texto(data.get("storeName", "")),
         "proyecto": limpiar_texto(data.get("projectName", "")),
-        "importe": convertir_a_float(data.get("importe", 0)),
-        "iva": convertir_a_float(data.get("iva", 0)),
-        "total": convertir_a_float(data.get("total", 0)),
+        "importe":  convertir_a_float(data.get("importe", 0)),
+        "iva":      convertir_a_float(data.get("iva", 0)),
+        "total":    convertir_a_float(data.get("total", 0)),
     }
-
     lineas = []
     for item in data.get("cabinets", []):
         lineas.append({
-            "reference": limpiar_texto(item.get("reference", "")),
-            "name": limpiar_texto(item.get("name", "")),
-            "quantity": convertir_a_float(item.get("quantity", "")),
+            "reference":   limpiar_texto(item.get("reference", "")),
+            "name":        limpiar_texto(item.get("name", "")),
+            "quantity":    convertir_a_float(item.get("quantity", "")),
             "total_linea": convertir_a_float(item.get("total", "")),
             "observation": limpiar_texto(item.get("observation", "")),
         })
-
     return resumen, lineas
 
 
 # =========================================================
-# PDF
+# PARSEAR PDF
 # =========================================================
 
-def extraer_texto_pdf(pdf_file):
-    pdf_bytes = pdf_file.read()
+def extraer_texto_pdf(pdf_bytes):
     pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-
     texto = ""
     for page in pdf_doc:
         texto += page.get_text() + "\n"
-
-    return len(pdf_doc), texto
-
+    return texto
 
 def limpiar_lineas(texto):
     return [line.strip() for line in texto.splitlines() if line.strip()]
 
+def extraer_pedido_pdf(texto):
+    matches = re.findall(r'\b20\d{12}\b', texto)
+    if matches:
+        return matches[0]
+    return ""
 
 def parsear_cabecera_pdf(texto):
-    """
-    Adaptado al formato real mostrado:
-    tras 'Cliente:' aparecen:
-    pedido
-    creado
-    envío
-    cliente
-    tienda
-    """
-    lineas = limpiar_lineas(texto)
-
-    pedido = ""
+    lineas  = limpiar_lineas(texto)
+    pedido  = extraer_pedido_pdf(texto)
     cliente = ""
-    tienda = ""
-
+    tienda  = ""
     try:
-        idx = lineas.index("Cliente:")
+        idx    = lineas.index("Cliente:")
         bloque = lineas[idx + 1: idx + 6]
-
         if len(bloque) >= 5:
-            pedido = limpiar_texto(bloque[0])
             cliente = limpiar_texto(bloque[3])
-            tienda = limpiar_texto(bloque[4])
+            tienda  = limpiar_texto(bloque[4])
     except ValueError:
         pass
-
-    return {
-        "pedido": pedido,
-        "cliente": cliente,
-        "tienda": tienda,
-    }
-
+    return {"pedido": pedido, "cliente": cliente, "tienda": tienda}
 
 def extraer_importes_pdf(texto):
-    """
-    Coge los últimos 3 importes decimales del PDF:
-    IMPORTE, IVA, TOTAL
-    """
-    lineas = limpiar_lineas(texto)
-    numeros = []
-
-    for linea in lineas:
-        if re.fullmatch(r"\d+\.\d{2}", linea):
-            numeros.append(linea)
-
+    lineas  = limpiar_lineas(texto)
+    numeros = [l for l in lineas if re.fullmatch(r"\d+\.\d{2}", l)]
     if len(numeros) >= 3:
         return {
             "importe": convertir_a_float(numeros[-3]),
-            "iva": convertir_a_float(numeros[-2]),
-            "total": convertir_a_float(numeros[-1]),
+            "iva":     convertir_a_float(numeros[-2]),
+            "total":   convertir_a_float(numeros[-1]),
         }
-
-    return {
-        "importe": None,
-        "iva": None,
-        "total": None,
-    }
-
+    return {"importe": None, "iva": None, "total": None}
 
 def es_referencia_valida(linea):
     linea = linea.strip()
-
     exclusiones = {
         "POS", "MUEBLE", "UD.", "DESCRIPCION", "IMPORTE",
         "MUEBLES", "BAJOS", "MURALES", "ALTOS",
         "REGLETAS", "COSTADOS", "DECORATIVOS",
         "COMPLEMENTOS", "ACCESORIOS"
     }
-
     if linea.upper() in exclusiones:
         return False
-
     if re.fullmatch(r"[A-Z0-9][A-Z0-9\.\-]*", linea):
         if re.fullmatch(r"\d", linea):
             return False
         return True
-
     return False
 
-
 def parsear_lineas_pdf(texto):
-    lineas = limpiar_lineas(texto)
+    lineas     = limpiar_lineas(texto)
     resultados = []
-
     i = 0
     while i < len(lineas):
         actual = lineas[i]
-
         if es_referencia_valida(actual):
-            referencia = actual
+            referencia  = actual
             descripcion = ""
-            cantidad = None
-            importe = None
-
+            cantidad    = None
+            importe     = None
             for back in range(1, 4):
                 if i - back >= 0 and re.fullmatch(r"\d+", lineas[i - back]):
                     cantidad = convertir_a_float(lineas[i - back])
                     break
-
             if i + 1 < len(lineas):
                 descripcion = limpiar_texto(lineas[i + 1])
-
             for j in range(i + 1, min(i + 12, len(lineas))):
                 if re.fullmatch(r"\d+\.\d{2}", lineas[j]):
                     importe = convertir_a_float(lineas[j])
                     break
-
             resultados.append({
-                "reference": limpiar_texto(referencia),
-                "description": descripcion,
-                "quantity": cantidad,
+                "reference":     limpiar_texto(referencia),
+                "description":   descripcion,
+                "quantity":      cantidad,
                 "importe_linea": importe,
             })
-
         i += 1
-
     vistos = set()
     unicos = []
     for item in resultados:
@@ -219,13 +185,7 @@ def parsear_lineas_pdf(texto):
         if clave not in vistos:
             vistos.add(clave)
             unicos.append(item)
-
     return unicos
-
-
-# =========================================================
-# COMPARACIÓN
-# =========================================================
 
 def indexar_por_referencia(lineas):
     refs = {}
@@ -236,309 +196,226 @@ def indexar_por_referencia(lineas):
     return refs
 
 
-def son_textos_distintos(a, b):
-    return limpiar_upper(a) != limpiar_upper(b)
+# =========================================================
+# COMPARAR UN PAR
+# =========================================================
 
+def comparar_par(json_resumen, json_lineas, pdf_resumen, pdf_lineas):
+    diferencias = []
+    criticas    = []
+    avisos      = []
 
-def son_numeros_distintos(a, b):
-    fa = convertir_a_float(a)
-    fb = convertir_a_float(b)
+    campos = [
+        ("Cliente",  json_resumen["cliente"],  pdf_resumen["cliente"],  False),
+        ("Pedido",   json_resumen["pedido"],   pdf_resumen["pedido"],   False),
+        ("Tienda",   json_resumen["tienda"],   pdf_resumen["tienda"],   False),
+        ("Importe",  json_resumen["importe"],  pdf_resumen["importe"],  True),
+        ("IVA",      json_resumen["iva"],      pdf_resumen["iva"],      True),
+        ("Total",    json_resumen["total"],    pdf_resumen["total"],    True),
+    ]
 
-    if fa is None and fb is None:
-        return False
-    if fa is None or fb is None:
-        return True
-    return fa != fb
+    for campo, vj, vp, es_num in campos:
+        hay_diff = son_numeros_distintos(vj, vp) if es_num else son_textos_distintos(vj, vp)
+        if hay_diff:
+            diff_str = ""
+            if es_num:
+                fj = convertir_a_float(vj)
+                fp = convertir_a_float(vp)
+                if fj is not None and fp is not None:
+                    diff_str = a_euro(round(fp - fj, 2))
+                criticas.append({"Campo": campo, "JSON": a_euro(vj), "PDF": a_euro(vp), "Diferencia": diff_str, "Qué corregir": f"El {campo} no coincide. Revisar."})
+                gravedad = "🔴 Crítico"
+            else:
+                avisos.append({"Campo": campo, "JSON": vj, "PDF": vp, "Diferencia": "", "Qué corregir": f"El {campo} no coincide. Verificar."})
+                gravedad = "🟡 Aviso"
+            diferencias.append({"Gravedad": gravedad, "Tipo": "Cabecera", "Campo": campo, "Referencia": "CABECERA",
+                                 "Valor JSON": a_euro(vj) if es_num else vj, "Valor PDF": a_euro(vp) if es_num else vp,
+                                 "Diferencia": diff_str, "Qué corregir": f"{campo} no coincide."})
+
+    refs_json = indexar_por_referencia(json_lineas)
+    refs_pdf  = indexar_por_referencia(pdf_lineas)
+    solo_json = sorted(set(refs_json.keys()) - set(refs_pdf.keys()))
+    solo_pdf  = sorted(set(refs_pdf.keys())  - set(refs_json.keys()))
+    comunes   = sorted(set(refs_json.keys()) & set(refs_pdf.keys()))
+
+    for ref in solo_json:
+        criticas.append({"Campo": "Falta en PDF", "JSON": ref, "PDF": "—", "Diferencia": "", "Qué corregir": f"Referencia {ref} en JSON pero no en PDF."})
+        diferencias.append({"Gravedad": "🔴 Crítico", "Tipo": "Línea", "Campo": "Solo en JSON", "Referencia": ref,
+                             "Valor JSON": ref, "Valor PDF": "", "Diferencia": "", "Qué corregir": f"Referencia {ref} no encontrada en PDF."})
+
+    for ref in solo_pdf:
+        avisos.append({"Campo": "Extra en PDF", "JSON": "—", "PDF": ref, "Diferencia": "", "Qué corregir": f"Referencia {ref} en PDF pero no en JSON."})
+        diferencias.append({"Gravedad": "🟡 Aviso", "Tipo": "Línea", "Campo": "Solo en PDF", "Referencia": ref,
+                             "Valor JSON": "", "Valor PDF": ref, "Diferencia": "", "Qué corregir": f"Referencia {ref} no encontrada en JSON."})
+
+    for ref in comunes:
+        j = refs_json[ref]
+        p = refs_pdf[ref]
+
+        if son_numeros_distintos(j.get("quantity"), p.get("quantity")):
+            avisos.append({"Campo": f"Cantidad — {ref}", "JSON": str(j.get("quantity")), "PDF": str(p.get("quantity")),
+                           "Diferencia": "", "Qué corregir": f"Cantidad de {ref}: JSON={j.get('quantity')} PDF={p.get('quantity')}"})
+            diferencias.append({"Gravedad": "🟡 Aviso", "Tipo": "Línea", "Campo": "Cantidad", "Referencia": ref,
+                                 "Valor JSON": str(j.get("quantity")), "Valor PDF": str(p.get("quantity")),
+                                 "Diferencia": "", "Qué corregir": f"Cantidad diferente en {ref}."})
+
+        if son_numeros_distintos(j.get("total_linea"), p.get("importe_linea")):
+            fj   = convertir_a_float(j.get("total_linea"))
+            fp   = convertir_a_float(p.get("importe_linea"))
+            diff = a_euro(round(fp - fj, 2)) if fj is not None and fp is not None else ""
+            criticas.append({"Campo": f"Precio — {ref}", "JSON": a_euro(fj), "PDF": a_euro(fp),
+                             "Diferencia": diff, "Qué corregir": f"Precio de {ref}: JSON={a_euro(fj)} PDF={a_euro(fp)} Dif={diff}"})
+            diferencias.append({"Gravedad": "🔴 Crítico", "Tipo": "Línea", "Campo": "Precio", "Referencia": ref,
+                                 "Valor JSON": a_euro(fj), "Valor PDF": a_euro(fp),
+                                 "Diferencia": diff, "Qué corregir": f"Precio diferente en {ref}. Dif: {diff}"})
+
+    return diferencias, criticas, avisos
 
 
 # =========================================================
-# SUBIDA DE ARCHIVOS
+# MOSTRAR RESULTADO DE UN CLIENTE
 # =========================================================
 
-json_file = st.file_uploader("Subir archivo JSON", type=["json"])
-pdf_file = st.file_uploader("Subir archivo PDF", type=["pdf"])
+def mostrar_resultado(pedido, cliente, json_resumen, pdf_resumen, diferencias, criticas, avisos):
+    n_crit  = len(criticas)
+    n_avis  = len(avisos)
+    n_total = n_crit + n_avis
 
-json_resumen = None
-json_lineas = []
-pdf_resumen = None
-pdf_lineas = []
-pdf_texto = ""
+    with st.expander(f"📦 Pedido {pedido} — {cliente}", expanded=(n_crit > 0)):
+        if n_total == 0:
+            st.markdown('<div class="semaforo-verde">✅ TODO CORRECTO</div>', unsafe_allow_html=True)
+        elif n_crit > 0:
+            st.markdown(f'<div class="semaforo-rojo">🔴 {n_crit} crítica(s) — {n_avis} aviso(s)</div>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<div class="semaforo-amarillo">🟡 {n_avis} aviso(s) — Revisar</div>', unsafe_allow_html=True)
 
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Cliente", json_resumen["cliente"] or pdf_resumen["cliente"] or "—")
+        c2.metric("Pedido",  pedido)
+        c3.metric("Tienda",  json_resumen["tienda"]  or pdf_resumen["tienda"]  or "—")
 
-# =========================================================
-# PREVISUALIZACIÓN JSON
-# =========================================================
+        c4, c5, c6 = st.columns(3)
+        for col, campo, vj, vp in [(c4, "Importe", json_resumen["importe"], pdf_resumen["importe"]),
+                                    (c5, "IVA",     json_resumen["iva"],     pdf_resumen["iva"]),
+                                    (c6, "Total",   json_resumen["total"],   pdf_resumen["total"])]:
+            fj = convertir_a_float(vj)
+            fp = convertir_a_float(vp)
+            delta = round(fp - fj, 2) if fj and fp else None
+            col.metric(f"{campo} JSON", a_euro(fj), delta=f"{delta} €" if delta else None)
 
-if json_file is not None:
-    data = json.load(json_file)
-    json_resumen, json_lineas = parsear_json(data)
+        if criticas:
+            st.markdown("#### 🔴 Diferencias críticas")
+            for d in criticas:
+                st.error(f"**{d['Campo']}** → JSON: `{d['JSON']}` | PDF: `{d['PDF']}` {'| Dif: ' + d['Diferencia'] if d['Diferencia'] else ''}")
+                st.caption(f"💡 {d['Qué corregir']}")
 
-    st.subheader("Resumen del JSON")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write(f"Cliente: {json_resumen['cliente']}")
-        st.write(f"Pedido: {json_resumen['pedido']}")
-        st.write(f"Tienda: {json_resumen['tienda']}")
-        st.write(f"Proyecto: {json_resumen['proyecto']}")
-        st.write(f"Nº líneas: {len(json_lineas)}")
-
-    with col2:
-        st.write(f"Importe JSON: {a_euro(json_resumen['importe'])}")
-        st.write(f"IVA JSON: {a_euro(json_resumen['iva'])}")
-        st.write(f"Total JSON: {a_euro(json_resumen['total'])}")
-
-    if json_lineas:
-        st.subheader("Primeras líneas del JSON")
-        st.dataframe(pd.DataFrame(json_lineas[:10]), use_container_width=True)
-
-
-# =========================================================
-# PREVISUALIZACIÓN PDF
-# =========================================================
-
-if pdf_file is not None:
-    total_pages, pdf_texto = extraer_texto_pdf(pdf_file)
-    cabecera_pdf = parsear_cabecera_pdf(pdf_texto)
-    importes_pdf = extraer_importes_pdf(pdf_texto)
-    pdf_lineas = parsear_lineas_pdf(pdf_texto)
-
-    pdf_resumen = {
-        "cliente": cabecera_pdf["cliente"],
-        "pedido": cabecera_pdf["pedido"],
-        "tienda": cabecera_pdf["tienda"],
-        "importe": importes_pdf["importe"],
-        "iva": importes_pdf["iva"],
-        "total": importes_pdf["total"],
-        "paginas": total_pages,
-    }
-
-    st.subheader("Resumen del PDF")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write(f"Páginas PDF: {pdf_resumen['paginas']}")
-        st.write(f"Cliente PDF: {pdf_resumen['cliente']}")
-        st.write(f"Pedido PDF: {pdf_resumen['pedido']}")
-        st.write(f"Tienda PDF: {pdf_resumen['tienda']}")
-
-    with col2:
-        st.write(f"Importe PDF: {a_euro(pdf_resumen['importe'])}")
-        st.write(f"IVA PDF: {a_euro(pdf_resumen['iva'])}")
-        st.write(f"Total PDF: {a_euro(pdf_resumen['total'])}")
-        st.write(f"Líneas detectadas PDF: {len(pdf_lineas)}")
-
-    st.subheader("Vista previa PDF")
-    st.text_area("Texto extraído", pdf_texto[:5000], height=350)
-
-    if pdf_lineas:
-        st.subheader("Líneas detectadas en PDF")
-        st.dataframe(pd.DataFrame(pdf_lineas), use_container_width=True)
-
-
-# =========================================================
-# BOTÓN COMPARAR
-# =========================================================
-
-if st.button("Comparar"):
-    if json_resumen is None or pdf_resumen is None:
-        st.error("Debes subir el JSON y el PDF antes de comparar.")
-    else:
-        diferencias = []
-
-        st.subheader("Diferencias detectadas entre JSON y PDF")
-
-        # -------------------------
-        # CABECERA: solo diferencias
-        # -------------------------
-        if son_textos_distintos(json_resumen["cliente"], pdf_resumen["cliente"]):
-            st.error(
-                f"Cliente no coincide → JSON: {json_resumen['cliente']} | PDF: {pdf_resumen['cliente']}"
-            )
-            diferencias.append({
-                "tipo": "Cabecera",
-                "campo": "Cliente",
-                "referencia": "",
-                "valor_json": json_resumen["cliente"],
-                "valor_pdf": pdf_resumen["cliente"],
-                "diferencia": ""
-            })
-
-        if son_textos_distintos(json_resumen["pedido"], pdf_resumen["pedido"]):
-            st.error(
-                f"Pedido no coincide → JSON: {json_resumen['pedido']} | PDF: {pdf_resumen['pedido']}"
-            )
-            diferencias.append({
-                "tipo": "Cabecera",
-                "campo": "Pedido",
-                "referencia": "",
-                "valor_json": json_resumen["pedido"],
-                "valor_pdf": pdf_resumen["pedido"],
-                "diferencia": ""
-            })
-
-        if son_textos_distintos(json_resumen["tienda"], pdf_resumen["tienda"]):
-            st.error(
-                f"Tienda no coincide → JSON: {json_resumen['tienda']} | PDF: {pdf_resumen['tienda']}"
-            )
-            diferencias.append({
-                "tipo": "Cabecera",
-                "campo": "Tienda",
-                "referencia": "",
-                "valor_json": json_resumen["tienda"],
-                "valor_pdf": pdf_resumen["tienda"],
-                "diferencia": ""
-            })
-
-        if son_numeros_distintos(json_resumen["importe"], pdf_resumen["importe"]):
-            diferencia = None
-            if json_resumen["importe"] is not None and pdf_resumen["importe"] is not None:
-                diferencia = round(pdf_resumen["importe"] - json_resumen["importe"], 2)
-
-            st.error(
-                f"Estos importes no coinciden → "
-                f"JSON: {a_euro(json_resumen['importe'])} | PDF: {a_euro(pdf_resumen['importe'])} | "
-                f"Diferencia: {a_euro(diferencia)}"
-            )
-            diferencias.append({
-                "tipo": "Cabecera",
-                "campo": "Importe",
-                "referencia": "CABECERA",
-                "valor_json": a_euro(json_resumen["importe"]),
-                "valor_pdf": a_euro(pdf_resumen["importe"]),
-                "diferencia": a_euro(diferencia)
-            })
-
-        if son_numeros_distintos(json_resumen["iva"], pdf_resumen["iva"]):
-            diferencia = None
-            if json_resumen["iva"] is not None and pdf_resumen["iva"] is not None:
-                diferencia = round(pdf_resumen["iva"] - json_resumen["iva"], 2)
-
-            st.error(
-                f"Estos IVAs no coinciden → "
-                f"JSON: {a_euro(json_resumen['iva'])} | PDF: {a_euro(pdf_resumen['iva'])} | "
-                f"Diferencia: {a_euro(diferencia)}"
-            )
-            diferencias.append({
-                "tipo": "Cabecera",
-                "campo": "IVA",
-                "referencia": "CABECERA",
-                "valor_json": a_euro(json_resumen["iva"]),
-                "valor_pdf": a_euro(pdf_resumen["iva"]),
-                "diferencia": a_euro(diferencia)
-            })
-
-        if son_numeros_distintos(json_resumen["total"], pdf_resumen["total"]):
-            diferencia = None
-            if json_resumen["total"] is not None and pdf_resumen["total"] is not None:
-                diferencia = round(pdf_resumen["total"] - json_resumen["total"], 2)
-
-            st.error(
-                f"Estos totales no coinciden → "
-                f"JSON: {a_euro(json_resumen['total'])} | PDF: {a_euro(pdf_resumen['total'])} | "
-                f"Diferencia: {a_euro(diferencia)}"
-            )
-            diferencias.append({
-                "tipo": "Cabecera",
-                "campo": "Total",
-                "referencia": "CABECERA",
-                "valor_json": a_euro(json_resumen["total"]),
-                "valor_pdf": a_euro(pdf_resumen["total"]),
-                "diferencia": a_euro(diferencia)
-            })
-
-        # -------------------------
-        # LÍNEAS: solo diferencias
-        # -------------------------
-        st.subheader("Diferencias por líneas")
-
-        refs_json = indexar_por_referencia(json_lineas)
-        refs_pdf = indexar_por_referencia(pdf_lineas)
-
-        solo_json = sorted(set(refs_json.keys()) - set(refs_pdf.keys()))
-        solo_pdf = sorted(set(refs_pdf.keys()) - set(refs_json.keys()))
-        comunes = sorted(set(refs_json.keys()) & set(refs_pdf.keys()))
-
-        for ref in solo_json:
-            st.error(f"Referencia solo en JSON → {ref}")
-            diferencias.append({
-                "tipo": "Línea",
-                "campo": "Referencia solo en JSON",
-                "referencia": ref,
-                "valor_json": ref,
-                "valor_pdf": "",
-                "diferencia": ""
-            })
-
-        for ref in solo_pdf:
-            st.error(f"Referencia solo en PDF → {ref}")
-            diferencias.append({
-                "tipo": "Línea",
-                "campo": "Referencia solo en PDF",
-                "referencia": ref,
-                "valor_json": "",
-                "valor_pdf": ref,
-                "diferencia": ""
-            })
-
-        for ref in comunes:
-            j = refs_json[ref]
-            p = refs_pdf[ref]
-
-            if son_numeros_distintos(j.get("quantity"), p.get("quantity")):
-                st.error(
-                    f"Cantidad no coincide en referencia {ref} → "
-                    f"JSON: {j.get('quantity')} | PDF: {p.get('quantity')}"
-                )
-                diferencias.append({
-                    "tipo": "Línea",
-                    "campo": "Cantidad",
-                    "referencia": ref,
-                    "valor_json": j.get("quantity"),
-                    "valor_pdf": p.get("quantity"),
-                    "diferencia": ""
-                })
-
-            if son_numeros_distintos(j.get("total_linea"), p.get("importe_linea")):
-                diferencia = None
-                jv = convertir_a_float(j.get("total_linea"))
-                pv = convertir_a_float(p.get("importe_linea"))
-                if jv is not None and pv is not None:
-                    diferencia = round(pv - jv, 2)
-
-                st.error(
-                    f"Estos precios no coinciden en la referencia {ref} → "
-                    f"Precio JSON: {a_euro(j.get('total_linea'))} | "
-                    f"Precio PDF: {a_euro(p.get('importe_linea'))} | "
-                    f"Diferencia: {a_euro(diferencia)}"
-                )
-                diferencias.append({
-                    "tipo": "Línea",
-                    "campo": "Precio línea",
-                    "referencia": ref,
-                    "valor_json": a_euro(j.get("total_linea")),
-                    "valor_pdf": a_euro(p.get("importe_linea")),
-                    "diferencia": a_euro(diferencia)
-                })
-
-        # -------------------------
-        # RESUMEN FINAL
-        # -------------------------
-        st.subheader("Resumen final")
+        if avisos:
+            st.markdown("#### 🟡 Avisos")
+            for d in avisos:
+                st.warning(f"**{d['Campo']}** → JSON: `{d['JSON']}` | PDF: `{d['PDF']}`")
+                st.caption(f"💡 {d['Qué corregir']}")
 
         if diferencias:
-            st.error(f"Se han detectado {len(diferencias)} diferencias entre JSON y PDF.")
-            df_diferencias = pd.DataFrame(diferencias)
-            st.dataframe(df_diferencias, use_container_width=True)
-
-            excel_bytes = crear_excel_en_memoria(df_diferencias)
+            st.dataframe(pd.DataFrame(diferencias), use_container_width=True, hide_index=True)
+            excel = crear_excel_en_memoria(pd.DataFrame(diferencias))
             st.download_button(
-                label="Descargar Excel con diferencias",
-                data=excel_bytes,
-                file_name="diferencias_json_vs_pdf.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                label=f"📥 Descargar Excel — Pedido {pedido}",
+                data=excel,
+                file_name=f"diferencias_pedido_{pedido}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key=f"excel_{pedido}"
             )
-        else:
-            st.success("No se han detectado diferencias entre JSON y PDF.")
+
+
+# =========================================================
+# INTERFAZ PRINCIPAL
+# =========================================================
+
+st.title("📋 Comparador PDF vs JSON — Múltiples clientes")
+st.write("Sube todos los JSON y todos los PDF de golpe. La app los empareja automáticamente por número de pedido.")
+
+col1, col2 = st.columns(2)
+with col1:
+    json_files = st.file_uploader("📂 Archivos JSON", type=["json"], accept_multiple_files=True)
+with col2:
+    pdf_files  = st.file_uploader("📄 Archivos PDF",  type=["pdf"],  accept_multiple_files=True)
+
+if json_files and pdf_files:
+    st.markdown("---")
+
+    # Leer JSONs
+    jsons = {}
+    for f in json_files:
+        try:
+            data = json.load(f)
+            resumen, lineas = parsear_json(data)
+            if resumen["pedido"]:
+                jsons[resumen["pedido"]] = (resumen, lineas)
+            else:
+                st.warning(f"⚠️ {f.name} no tiene número de pedido.")
+        except Exception as e:
+            st.error(f"Error en {f.name}: {e}")
+
+    # Leer PDFs
+    pdfs = {}
+    for f in pdf_files:
+        try:
+            texto    = extraer_texto_pdf(f.read())
+            cabecera = parsear_cabecera_pdf(texto)
+            importes = extraer_importes_pdf(texto)
+            lineas   = parsear_lineas_pdf(texto)
+            pedido   = cabecera["pedido"]
+            if pedido:
+                pdfs[pedido] = ({
+                    "pedido":  pedido,
+                    "cliente": cabecera["cliente"],
+                    "tienda":  cabecera["tienda"],
+                    "importe": importes["importe"],
+                    "iva":     importes["iva"],
+                    "total":   importes["total"],
+                }, lineas)
+            else:
+                st.warning(f"⚠️ {f.name} no tiene número de pedido reconocible.")
+        except Exception as e:
+            st.error(f"Error en {f.name}: {e}")
+
+    # Emparejar
+    emparejados = sorted(set(jsons.keys()) & set(pdfs.keys()))
+    sin_pdf     = sorted(set(jsons.keys()) - set(pdfs.keys()))
+    sin_json    = sorted(set(pdfs.keys())  - set(jsons.keys()))
+
+    # Resumen general
+    st.markdown(f"### 📊 {len(emparejados)} pedido(s) comparado(s)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pares encontrados", len(emparejados))
+    c2.metric("JSON sin PDF",      len(sin_pdf))
+    c3.metric("PDF sin JSON",      len(sin_json))
+
+    for p in sin_pdf:
+        st.markdown(f'<div class="sin-pareja">⚠️ Pedido <b>{p}</b> — tiene JSON pero no se encontró su PDF</div>', unsafe_allow_html=True)
+    for p in sin_json:
+        st.markdown(f'<div class="sin-pareja">⚠️ Pedido <b>{p}</b> — tiene PDF pero no se encontró su JSON</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    # Comparar cada par
+    total_crit = 0
+    total_avis = 0
+
+    for pedido in emparejados:
+        json_resumen, json_lineas = jsons[pedido]
+        pdf_resumen,  pdf_lineas  = pdfs[pedido]
+        difs, criticas, avisos    = comparar_par(json_resumen, json_lineas, pdf_resumen, pdf_lineas)
+        total_crit += len(criticas)
+        total_avis += len(avisos)
+        mostrar_resultado(pedido, json_resumen["cliente"] or pdf_resumen["cliente"], json_resumen, pdf_resumen, difs, criticas, avisos)
+
+    # Semáforo global
+    st.markdown("---")
+    st.markdown("### 🚦 Estado general")
+    if total_crit > 0:
+        st.markdown(f'<div class="semaforo-rojo">🔴 HAY PROBLEMAS — {total_crit} diferencia(s) crítica(s) en total</div>', unsafe_allow_html=True)
+    elif total_avis > 0:
+        st.markdown(f'<div class="semaforo-amarillo">🟡 REVISAR — {total_avis} aviso(s) en total</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="semaforo-verde">✅ TODOS LOS PEDIDOS CORRECTOS</div>', unsafe_allow_html=True)
