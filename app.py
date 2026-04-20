@@ -76,6 +76,8 @@ UMBRAL_PRECIO_LINEA = 4000.0
 # =========================================================
 
 def parsear_json(data):
+    # Comparación honesta con el PDF: leemos los campos tal cual vienen en el JSON.
+    # Si hay diferencia con el PDF, la app debe mostrarla, NO corregirla.
     resumen = {
         "pedido":   limpiar_texto(data.get("orderCode", "")),
         "cliente":  limpiar_texto(data.get("customerName", "")),
@@ -96,18 +98,33 @@ def parsear_json(data):
         if price_total is None:
             price_total = convertir_a_float(item.get("total"))
 
+        # Modelo y material de la puerta/frente
+        doors = item.get("doors") or {}
+        model_door    = limpiar_texto(item.get("modelDoor") or doors.get("name") or "")
+        material_door = limpiar_texto(item.get("materialDoor") or doors.get("material") or "")
+
+        # Material del armazón (muebles, regletas con armazón)
+        material_cabinet = limpiar_texto(item.get("materialCabinet") or "")
+
+        # Material genérico (complementos, costados, zócalos → "Acabado" en PDF)
+        material = limpiar_texto(item.get("material") or "")
+
         lineas.append({
-            "id":          limpiar_texto(item.get("id", "")),
-            "reference":   limpiar_texto(item.get("reference", "")),
-            "name":        limpiar_texto(item.get("name", "")),
-            "quantity":    convertir_a_float(item.get("quantity", "")),
-            "total_linea": convertir_a_float(item.get("total", "")),
-            "observation": limpiar_texto(item.get("observation", "")),
-            "opening":     limpiar_texto(item.get("opening", "")),
-            "size_x":      size_x,
-            "size_y":      size_y,
-            "size_z":      size_z,
-            "price_total": price_total,
+            "id":               limpiar_texto(item.get("id", "")),
+            "reference":        limpiar_texto(item.get("reference", "")),
+            "name":             limpiar_texto(item.get("name", "")),
+            "quantity":         convertir_a_float(item.get("quantity", "")),
+            "total_linea":      convertir_a_float(item.get("total", "")),
+            "observation":      limpiar_texto(item.get("observation", "")),
+            "opening":          limpiar_texto(item.get("opening", "")),
+            "size_x":           size_x,
+            "size_y":           size_y,
+            "size_z":           size_z,
+            "price_total":      price_total,
+            "model_door":       model_door,
+            "material_door":    material_door,
+            "material_cabinet": material_cabinet,
+            "material":         material,
         })
     return resumen, lineas
 
@@ -263,21 +280,77 @@ def _parsear_estrategia_C_ref_por_patron(lineas):
     return indices_pos
 
 
-def extraer_datos_bloque_pdf(bloque_texto):
+def extraer_datos_bloque_pdf(bloque_lineas):
+    """
+    Extrae tamaño, opening y materiales del bloque de líneas que corresponden a UNA POS.
+    Cada línea se examina por separado para que no se mezcle texto entre campos ni con otras POS.
+    """
     size_x = size_y = size_z = None
     opening = ""
-    m = re.search(
-        r"L\s*:\s*(\d+)\s*F\s*:\s*(\d+)\s*A\s*:\s*(\d+)",
-        bloque_texto, flags=re.IGNORECASE,
-    )
-    if m:
-        size_x = convertir_a_int(m.group(1))
-        size_y = convertir_a_int(m.group(2))
-        size_z = convertir_a_int(m.group(3))
-    m2 = re.search(r"M\s*:\s*(Izquierda|Derecha)", bloque_texto, flags=re.IGNORECASE)
-    if m2:
-        opening = m2.group(1).capitalize()
-    return size_x, size_y, size_z, opening
+    model_door = ""
+    material_door = ""
+    material_cabinet = ""
+    material = ""
+
+    for linea in bloque_lineas:
+        # Tamaño: "L: 400 F: 600 A: 2250"
+        if size_x is None:
+            m = re.search(r"L\s*:\s*(\d+)\s*F\s*:\s*(\d+)\s*A\s*:\s*(\d+)", linea, flags=re.IGNORECASE)
+            if m:
+                size_x = convertir_a_int(m.group(1))
+                size_y = convertir_a_int(m.group(2))
+                size_z = convertir_a_int(m.group(3))
+                continue
+
+        # Apertura: "M: Izquierda" / "M: Derecha"
+        if not opening:
+            m = re.search(r"^M\s*:\s*(Izquierda|Derecha)\s*$", linea, flags=re.IGNORECASE)
+            if m:
+                opening = m.group(1).capitalize()
+                continue
+
+        # "- Puertas: ESTRATO-196-FENIX VERDE KITAMI / "
+        if not material_door and not model_door:
+            m = re.search(r"^-?\s*Puertas\s*:\s*(.+?)\s*/?\s*$", linea, flags=re.IGNORECASE)
+            if m:
+                valor = m.group(1).strip()
+                if "-" in valor:
+                    partes = valor.split("-", 1)
+                    model_door    = partes[0].strip()
+                    material_door = partes[1].strip()
+                else:
+                    material_door = valor
+                continue
+
+        # "- Frente: 196-FENIX VERDE KITAMI"
+        if not material_door:
+            m = re.search(r"^-?\s*Frente\s*:\s*(.+)$", linea, flags=re.IGNORECASE)
+            if m:
+                material_door = m.group(1).strip()
+                continue
+
+        # "- Armazón:172-ROBLE" o "- Armazon:172-ROBLE"
+        if not material_cabinet:
+            m = re.search(r"^-?\s*Armaz[oó]n\s*:\s*(.+)$", linea, flags=re.IGNORECASE)
+            if m:
+                material_cabinet = m.group(1).strip()
+                continue
+
+        # "- Acabado:172-ROBLE" o "- Acabado:Laton"
+        if not material:
+            m = re.search(r"^-?\s*Acabado\s*:\s*(.+)$", linea, flags=re.IGNORECASE)
+            if m:
+                material = m.group(1).strip()
+                continue
+
+    return {
+        "size_x": size_x, "size_y": size_y, "size_z": size_z,
+        "opening": opening,
+        "model_door": model_door,
+        "material_door": material_door,
+        "material_cabinet": material_cabinet,
+        "material": material,
+    }
 
 
 def parsear_lineas_pdf(texto, debug_log=None):
@@ -337,18 +410,22 @@ def parsear_lineas_pdf(texto, debug_log=None):
                 importe = convertir_a_float(l)
                 break
 
-        size_x, size_y, size_z, opening = extraer_datos_bloque_pdf(bloque_texto)
+        datos = extraer_datos_bloque_pdf(bloque_lineas)
 
         resultados.append({
-            "pos":           str(pos),
-            "reference":     limpiar_texto(ref),
-            "description":   descripcion,
-            "quantity":      convertir_a_float(qty) if qty != "?" else None,
-            "importe_linea": importe,
-            "size_x":        size_x,
-            "size_y":        size_y,
-            "size_z":        size_z,
-            "opening":       opening,
+            "pos":              str(pos),
+            "reference":        limpiar_texto(ref),
+            "description":      descripcion,
+            "quantity":         convertir_a_float(qty) if qty != "?" else None,
+            "importe_linea":    importe,
+            "size_x":           datos["size_x"],
+            "size_y":           datos["size_y"],
+            "size_z":           datos["size_z"],
+            "opening":          datos["opening"],
+            "model_door":       datos["model_door"],
+            "material_door":    datos["material_door"],
+            "material_cabinet": datos["material_cabinet"],
+            "material":         datos["material"],
         })
     return resultados
 
@@ -455,15 +532,13 @@ def comparar_par(json_resumen, json_lineas, pdf_resumen, pdf_lineas):
     solo_json = sorted(set(refs_json.keys()) - set(refs_pdf.keys()))
     solo_pdf  = sorted(set(refs_pdf.keys())  - set(refs_json.keys()))
 
-    for ref in solo_json:
-        criticas.append({"Campo": "Falta en PDF", "JSON": ref, "PDF": "—", "Diferencia": "", "Qué corregir": f"Referencia {ref} en JSON pero no en PDF."})
-        diferencias.append({"Gravedad": "🔴 Crítico", "Tipo": "Línea", "Campo": "Solo en JSON", "Referencia": ref,
-                             "Valor JSON": ref, "Valor PDF": "", "Diferencia": "", "Qué corregir": f"Referencia {ref} no encontrada en PDF."})
-
+    # Avisar si hay referencias que están en PDF pero no en el JSON (líneas sobrantes).
+    # Las referencias que están en JSON pero no en PDF se detectan luego por id
+    # (saldrán como "Sin pareja en PDF" en la tabla).
     for ref in solo_pdf:
-        avisos.append({"Campo": "Extra en PDF", "JSON": "—", "PDF": ref, "Diferencia": "", "Qué corregir": f"Referencia {ref} en PDF pero no en JSON."})
+        avisos.append({"Campo": "Extra en PDF", "JSON": "—", "PDF": ref, "Diferencia": "", "Qué corregir": f"Referencia {ref} aparece en el PDF pero no en el JSON."})
         diferencias.append({"Gravedad": "🟡 Aviso", "Tipo": "Línea", "Campo": "Solo en PDF", "Referencia": ref,
-                             "Valor JSON": "", "Valor PDF": ref, "Diferencia": "", "Qué corregir": f"Referencia {ref} no encontrada en JSON."})
+                             "Valor JSON": "", "Valor PDF": ref, "Diferencia": "", "Qué corregir": f"Referencia {ref} aparece solo en el PDF."})
 
     comparacion_id, criticas_id, avisos_id, diferencias_id = comparar_por_id(json_lineas, pdf_lineas)
     criticas.extend(criticas_id)
@@ -489,20 +564,29 @@ def comparar_por_id(json_lineas, pdf_lineas):
         tam_json = formatear_tamano(j.get("size_x"), j.get("size_y"), j.get("size_z"))
         precio_j = j.get("price_total")
         precio_j_str = a_euro(precio_j) if precio_j is not None else "—"
+        cant_j   = j.get("quantity")
+        cant_j_str = str(int(cant_j)) if cant_j is not None and cant_j == int(cant_j) else (str(cant_j) if cant_j is not None else "—")
+
+        # Material a mostrar en la tabla (el primero que tenga valor, con etiqueta del tipo)
+        mat_json_resumen = _resumir_materiales_json(j)
 
         precio_elevado = precio_j is not None and precio_j > UMBRAL_PRECIO_LINEA
 
         if p is None:
             filas_tabla.append({
-                "ID":          id_json,
-                "Referencia":  ref,
-                "Nombre":      nombre + (f" ({opening})" if opening else ""),
-                "Tamaño JSON": tam_json,
-                "Tamaño PDF":  "—",
-                "Precio JSON": precio_j_str + (" ⚠️" if precio_elevado else ""),
-                "Precio PDF":  "—",
-                "Dif. precio": "—",
-                "Estado":      "🔴 Sin pareja en PDF",
+                "ID":           id_json,
+                "Referencia":   ref,
+                "Nombre":       nombre + (f" ({opening})" if opening else ""),
+                "Cant. JSON":   cant_j_str,
+                "Cant. PDF":    "—",
+                "Tamaño JSON":  tam_json,
+                "Tamaño PDF":   "—",
+                "Precio JSON":  precio_j_str + (" ⚠️" if precio_elevado else ""),
+                "Precio PDF":   "—",
+                "Dif. precio":  "—",
+                "Material JSON": mat_json_resumen,
+                "Material PDF": "—",
+                "Estado":       "🔴 Sin pareja en PDF",
             })
             criticas.append({
                 "Campo": f"ID {id_json} ({ref})",
@@ -522,6 +606,10 @@ def comparar_por_id(json_lineas, pdf_lineas):
             tam_pdf = formatear_tamano(p.get("size_x"), p.get("size_y"), p.get("size_z"))
             precio_p = convertir_a_float(p.get("importe_linea"))
             precio_p_str = a_euro(precio_p) if precio_p is not None else "—"
+            cant_p   = p.get("quantity")
+            cant_p_str = str(int(cant_p)) if cant_p is not None and cant_p == int(cant_p) else (str(cant_p) if cant_p is not None else "—")
+
+            mat_pdf_resumen = _resumir_materiales_pdf(p)
 
             if precio_j is not None and precio_p is not None:
                 dif_precio = round(precio_p - precio_j, 2)
@@ -530,6 +618,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
                 dif_precio = None
                 dif_precio_str = "—"
 
+            # --- Comparación de tamaño (eje a eje) ---
             diffs_ejes = []
             for eje, vj, vp in [
                 ("x/L", j.get("size_x"), p.get("size_x")),
@@ -539,23 +628,44 @@ def comparar_por_id(json_lineas, pdf_lineas):
                 if vj != vp:
                     diffs_ejes.append(f"{eje}: JSON={vj} / PDF={vp}")
 
+            # --- Comparación de cantidad ---
+            cant_distinta = son_numeros_distintos(cant_j, cant_p)
+
+            # --- Comparación de materiales ---
+            # Compara solo los campos de material que tienen valor en JSON Y PDF
+            # Lista de (etiqueta, valor_json, valor_pdf)
+            comparaciones_mat = [
+                ("Modelo puerta",   j.get("model_door"),       p.get("model_door")),
+                ("Material puerta", j.get("material_door"),    p.get("material_door")),
+                ("Armazón",         j.get("material_cabinet"), p.get("material_cabinet")),
+                ("Acabado",         j.get("material"),         p.get("material")),
+            ]
+            diffs_mat = []
+            for etiqueta, vj, vp in comparaciones_mat:
+                vjn = limpiar_upper(vj)
+                vpn = limpiar_upper(vp)
+                # Solo comparamos si AMBOS lados tienen valor (no inventamos avisos falsos)
+                if vjn and vpn and vjn != vpn:
+                    diffs_mat.append(f"{etiqueta}: JSON={vj!r} / PDF={vp!r}")
+
+            # --- Estado resumen ---
             motivos = []
-            if diffs_ejes:
-                motivos.append("tamaño")
-            if dif_precio is not None and dif_precio != 0:
-                motivos.append("precio")
+            if diffs_ejes:      motivos.append("tamaño")
+            if cant_distinta:   motivos.append("cantidad")
+            if dif_precio is not None and dif_precio != 0: motivos.append("precio")
+            if diffs_mat:       motivos.append("material")
 
             if motivos:
                 estado = "🔴 " + " + ".join(motivos).capitalize() + " distinto"
             else:
                 estado = "🟢 OK"
 
+            # --- Registrar cada diferencia individualmente ---
             if diffs_ejes:
                 detalle = " · ".join(diffs_ejes)
                 criticas.append({
                     "Campo": f"Tamaño — {id_json} ({ref})",
-                    "JSON": tam_json,
-                    "PDF": tam_pdf,
+                    "JSON": tam_json, "PDF": tam_pdf,
                     "Diferencia": detalle,
                     "Qué corregir": f"Tamaño distinto en {ref} (id {id_json}): {detalle}",
                 })
@@ -567,11 +677,25 @@ def comparar_por_id(json_lineas, pdf_lineas):
                     "Qué corregir": f"Tamaño distinto en {ref}: {detalle}",
                 })
 
+            if cant_distinta:
+                criticas.append({
+                    "Campo": f"Cantidad — {id_json} ({ref})",
+                    "JSON": cant_j_str, "PDF": cant_p_str,
+                    "Diferencia": "",
+                    "Qué corregir": f"Cantidad distinta en {ref} (id {id_json}): JSON={cant_j_str} / PDF={cant_p_str}",
+                })
+                diferencias.append({
+                    "Gravedad": "🔴 Crítico", "Tipo": "ID",
+                    "Campo": "Cantidad", "Referencia": f"{id_json} / {ref}",
+                    "Valor JSON": cant_j_str, "Valor PDF": cant_p_str,
+                    "Diferencia": "",
+                    "Qué corregir": f"Cantidad distinta en {ref}.",
+                })
+
             if dif_precio is not None and dif_precio != 0:
                 criticas.append({
                     "Campo": f"Precio línea — {id_json} ({ref})",
-                    "JSON": precio_j_str,
-                    "PDF": precio_p_str,
+                    "JSON": precio_j_str, "PDF": precio_p_str,
                     "Diferencia": dif_precio_str,
                     "Qué corregir": f"Precio de línea {ref} (id {id_json}): JSON={precio_j_str} PDF={precio_p_str} Dif={dif_precio_str}",
                 })
@@ -583,16 +707,35 @@ def comparar_por_id(json_lineas, pdf_lineas):
                     "Qué corregir": f"Precio de línea distinto en {ref}.",
                 })
 
+            for detalle_mat in diffs_mat:
+                criticas.append({
+                    "Campo": f"Material — {id_json} ({ref})",
+                    "JSON": mat_json_resumen, "PDF": mat_pdf_resumen,
+                    "Diferencia": detalle_mat,
+                    "Qué corregir": f"{detalle_mat} (id {id_json})",
+                })
+                diferencias.append({
+                    "Gravedad": "🔴 Crítico", "Tipo": "ID",
+                    "Campo": "Material/Acabado", "Referencia": f"{id_json} / {ref}",
+                    "Valor JSON": mat_json_resumen, "Valor PDF": mat_pdf_resumen,
+                    "Diferencia": detalle_mat,
+                    "Qué corregir": detalle_mat,
+                })
+
             filas_tabla.append({
-                "ID":          id_json,
-                "Referencia":  ref,
-                "Nombre":      nombre + (f" ({opening})" if opening else ""),
-                "Tamaño JSON": tam_json,
-                "Tamaño PDF":  tam_pdf,
-                "Precio JSON": precio_j_str + (" ⚠️" if precio_elevado else ""),
-                "Precio PDF":  precio_p_str,
-                "Dif. precio": dif_precio_str,
-                "Estado":      estado,
+                "ID":            id_json,
+                "Referencia":    ref,
+                "Nombre":        nombre + (f" ({opening})" if opening else ""),
+                "Cant. JSON":    cant_j_str,
+                "Cant. PDF":     cant_p_str,
+                "Tamaño JSON":   tam_json,
+                "Tamaño PDF":    tam_pdf,
+                "Precio JSON":   precio_j_str + (" ⚠️" if precio_elevado else ""),
+                "Precio PDF":    precio_p_str,
+                "Dif. precio":   dif_precio_str,
+                "Material JSON": mat_json_resumen,
+                "Material PDF":  mat_pdf_resumen,
+                "Estado":        estado,
             })
 
         if precio_elevado:
@@ -612,6 +755,34 @@ def comparar_por_id(json_lineas, pdf_lineas):
             })
 
     return filas_tabla, criticas, avisos, diferencias
+
+
+def _resumir_materiales_json(linea):
+    """Devuelve un string resumen de los materiales/modelo presentes en el JSON."""
+    partes = []
+    if linea.get("model_door") and linea.get("material_door"):
+        partes.append(f"Puerta: {linea['model_door']}-{linea['material_door']}")
+    elif linea.get("material_door"):
+        partes.append(f"Frente: {linea['material_door']}")
+    if linea.get("material_cabinet"):
+        partes.append(f"Armazón: {linea['material_cabinet']}")
+    if linea.get("material") and not partes:
+        partes.append(f"Acabado: {linea['material']}")
+    return " | ".join(partes) if partes else "—"
+
+
+def _resumir_materiales_pdf(linea):
+    """Devuelve un string resumen de los materiales/modelo presentes en el PDF."""
+    partes = []
+    if linea.get("model_door") and linea.get("material_door"):
+        partes.append(f"Puerta: {linea['model_door']}-{linea['material_door']}")
+    elif linea.get("material_door"):
+        partes.append(f"Frente: {linea['material_door']}")
+    if linea.get("material_cabinet"):
+        partes.append(f"Armazón: {linea['material_cabinet']}")
+    if linea.get("material") and not partes:
+        partes.append(f"Acabado: {linea['material']}")
+    return " | ".join(partes) if partes else "—"
 
 
 # =========================================================
