@@ -117,20 +117,26 @@ def parsear_json(data):
 # =========================================================
 
 def extraer_texto_pdf(pdf_bytes):
+    """Extrae texto probando varios modos de PyMuPDF para maximizar robustez."""
     pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    # Usamos "text" que devuelve el texto en orden de lectura con saltos de línea.
     texto = ""
     for page in pdf_doc:
-        texto += page.get_text() + "\n"
+        texto += page.get_text("text") + "\n"
+    pdf_doc.close()
     return texto
+
 
 def limpiar_lineas(texto):
     return [line.strip() for line in texto.splitlines() if line.strip()]
+
 
 def extraer_pedido_pdf(texto):
     matches = re.findall(r'\b20\d{12}\b', texto)
     if matches:
         return matches[0]
     return ""
+
 
 def parsear_cabecera_pdf(texto):
     lineas  = limpiar_lineas(texto)
@@ -147,6 +153,7 @@ def parsear_cabecera_pdf(texto):
         pass
     return {"pedido": pedido, "cliente": cliente, "tienda": tienda}
 
+
 def extraer_importes_pdf(texto):
     lineas  = limpiar_lineas(texto)
     numeros = [l for l in lineas if re.fullmatch(r"\d+\.\d{2}", l)]
@@ -159,19 +166,101 @@ def extraer_importes_pdf(texto):
     return {"importe": None, "iva": None, "total": None}
 
 
-RE_POS_LINEA = re.compile(r"^(\d{1,3})\s+(\d{1,4})\s+(.+)$")
+# ---------- PARSER PDF ROBUSTO (3 estrategias) ----------
+
+RE_POS_UNA_LINEA = re.compile(r"^(\d{1,3})\s+(\d{1,4})\s+(.+)$")
+
+SECCIONES_VALIDAS = {"MUEBLES MURALES", "MUEBLES BAJOS", "MUEBLES ALTOS",
+                      "REGLETAS", "COSTADOS", "COMPLEMENTOS",
+                      "ACCESORIOS", "DECORATIVOS", "ELECTRODOMESTICOS", "ENCIMERAS"}
+
+EXCLUIDOS_REF = {"POS", "MUEBLE", "UD.", "DESCRIPCION", "IMPORTE",
+                 "MUEBLES", "BAJOS", "MURALES", "ALTOS",
+                 "REGLETAS", "COSTADOS", "DECORATIVOS",
+                 "COMPLEMENTOS", "ACCESORIOS", "ENCIMERAS",
+                 "ELECTRODOMESTICOS", "IMPORTE", "I.V.A.",
+                 "PRECIO", "TOTAL", "MODELO", "ACABADO",
+                 "ARMAZÓN", "ARMAZON", "ZÓCALO", "ZOCALO",
+                 "TIRADOR", "CAJÓN", "CAJON", "CLIENTE", "CREADO",
+                 "REFERENCIA"}
 
 
-def es_linea_pos(linea):
-    if linea.upper().startswith("POS MUEBLE"):
-        return None
-    m = RE_POS_LINEA.match(linea)
-    if not m:
-        return None
-    pos, qty, ref = m.group(1), m.group(2), m.group(3).strip()
-    if re.fullmatch(r"\d+\.\d{2}", ref):
-        return None
-    return pos, qty, ref
+def _parsear_estrategia_A_pos_una_linea(lineas):
+    """Estrategia A: la POS viene como '1 1 ME2P40CX' en una sola línea."""
+    indices_pos = []
+    for idx, linea in enumerate(lineas):
+        if linea.upper().startswith("POS MUEBLE"):
+            continue
+        m = RE_POS_UNA_LINEA.match(linea)
+        if not m:
+            continue
+        pos, qty, ref = m.group(1), m.group(2), m.group(3).strip()
+        if re.fullmatch(r"\d+\.\d{2}", ref):
+            continue
+        if ref.upper() in EXCLUIDOS_REF:
+            continue
+        indices_pos.append((idx, pos, qty, ref))
+    return indices_pos
+
+
+def _parsear_estrategia_B_pos_separada(lineas):
+    """
+    Estrategia B: POS en varias líneas consecutivas.
+    Ejemplo:
+        1
+        1
+        ME2P40CX
+    """
+    indices_pos = []
+    i = 0
+    while i < len(lineas) - 2:
+        l1, l2, l3 = lineas[i], lineas[i+1], lineas[i+2]
+        # l1 = número de posición (1-3 dígitos)
+        # l2 = cantidad (1-4 dígitos)
+        # l3 = referencia (no es número, no es sección, no es cabecera)
+        if (re.fullmatch(r"\d{1,3}", l1)
+                and re.fullmatch(r"\d{1,4}", l2)
+                and not re.fullmatch(r"\d+(\.\d+)?", l3)
+                and l3.upper() not in EXCLUIDOS_REF
+                and l3.upper() not in SECCIONES_VALIDAS
+                and not l3.upper().startswith("POS MUEBLE")
+                and len(l3) >= 2):
+            indices_pos.append((i, l1, l2, l3))
+            i += 3
+            continue
+        i += 1
+    return indices_pos
+
+
+def _parsear_estrategia_C_ref_por_patron(lineas):
+    """
+    Estrategia C (último recurso): busca cualquier línea que PAREZCA una referencia
+    (mayúsculas y números como ME2P40CX, RM230, CSM2, ZAL10.200, Puerta, Complemento)
+    y que tenga cerca un 'L: x F: y A: z' e importe.
+    """
+    indices_pos = []
+    for idx, linea in enumerate(lineas):
+        if linea.upper() in EXCLUIDOS_REF:
+            continue
+        if linea.upper() in SECCIONES_VALIDAS:
+            continue
+        if re.fullmatch(r"\d+(\.\d+)?", linea):
+            continue
+        if linea.upper().startswith("POS MUEBLE"):
+            continue
+        # Referencias conocidas del ERP: códigos o palabras comunes
+        # Reglas: al menos 3 caracteres, no todo símbolos
+        if len(linea) < 3:
+            continue
+        # Descartar observaciones largas y descripciones
+        if len(linea.split()) > 3:
+            continue
+        # Comprobar que en las 15 líneas siguientes hay un patrón L:.. F:.. A:..
+        siguiente_15 = " ".join(lineas[idx+1: idx+16])
+        if not re.search(r"L\s*:\s*\d+.*F\s*:\s*\d+.*A\s*:\s*\d+", siguiente_15, re.IGNORECASE):
+            continue
+        indices_pos.append((idx, "?", "?", linea))
+    return indices_pos
 
 
 def extraer_datos_bloque_pdf(bloque_texto):
@@ -191,19 +280,44 @@ def extraer_datos_bloque_pdf(bloque_texto):
     return size_x, size_y, size_z, opening
 
 
-def parsear_lineas_pdf(texto):
+def parsear_lineas_pdf(texto, debug_log=None):
+    """
+    Parser robusto que prueba 3 estrategias en orden.
+    Si debug_log es una lista, registra información para mostrar al usuario.
+    """
     lineas = limpiar_lineas(texto)
 
-    indices_pos = []
-    for idx, linea in enumerate(lineas):
-        datos = es_linea_pos(linea)
-        if datos:
-            indices_pos.append((idx, datos))
+    if debug_log is not None:
+        debug_log.append(f"Total líneas tras limpieza: {len(lineas)}")
 
+    # Probar estrategia A
+    indices = _parsear_estrategia_A_pos_una_linea(lineas)
+    estrategia_usada = "A (POS en una línea)"
+
+    if not indices:
+        # Probar estrategia B
+        indices = _parsear_estrategia_B_pos_separada(lineas)
+        estrategia_usada = "B (POS en líneas separadas)"
+
+    if not indices:
+        # Probar estrategia C
+        indices = _parsear_estrategia_C_ref_por_patron(lineas)
+        estrategia_usada = "C (ref por patrón L:F:A)"
+
+    if debug_log is not None:
+        debug_log.append(f"Estrategia usada: {estrategia_usada}")
+        debug_log.append(f"POS detectadas: {len(indices)}")
+
+    if not indices:
+        return []
+
+    # Normalizar: indices es lista de (idx_linea, pos, qty, ref)
     resultados = []
-    for n, (idx, (pos, qty, ref)) in enumerate(indices_pos):
-        fin = indices_pos[n + 1][0] if n + 1 < len(indices_pos) else len(lineas)
-        bloque_lineas = lineas[idx + 1: fin]
+    for n, (idx, pos, qty, ref) in enumerate(indices):
+        fin = indices[n + 1][0] if n + 1 < len(indices) else len(lineas)
+        # Empieza un poco después para coger descripción, tamaño, observaciones
+        inicio = idx + 1
+        bloque_lineas = lineas[inicio: fin]
         bloque_texto  = " ".join(bloque_lineas)
 
         descripcion = ""
@@ -226,10 +340,10 @@ def parsear_lineas_pdf(texto):
         size_x, size_y, size_z, opening = extraer_datos_bloque_pdf(bloque_texto)
 
         resultados.append({
-            "pos":           pos,
+            "pos":           str(pos),
             "reference":     limpiar_texto(ref),
             "description":   descripcion,
-            "quantity":      convertir_a_float(qty),
+            "quantity":      convertir_a_float(qty) if qty != "?" else None,
             "importe_linea": importe,
             "size_x":        size_x,
             "size_y":        size_y,
@@ -504,7 +618,8 @@ def comparar_por_id(json_lineas, pdf_lineas):
 # MOSTRAR RESULTADO DE UN CLIENTE
 # =========================================================
 
-def mostrar_resultado(pedido, cliente, json_resumen, pdf_resumen, diferencias, criticas, avisos, comparacion_id):
+def mostrar_resultado(pedido, cliente, json_resumen, pdf_resumen, diferencias, criticas, avisos, comparacion_id,
+                      pdf_debug_texto=None, pdf_debug_log=None, pdf_lineas=None):
     n_crit  = len(criticas)
     n_avis  = len(avisos)
     n_total = n_crit + n_avis
@@ -554,6 +669,20 @@ def mostrar_resultado(pedido, cliente, json_resumen, pdf_resumen, diferencias, c
             df_id = pd.DataFrame(comparacion_id)
             st.dataframe(df_id, use_container_width=True, hide_index=True)
 
+        # ---------- PANEL DE DEPURACIÓN ----------
+        with st.expander("🛠️ Depuración del PDF (ábreme si algo no cuadra)"):
+            st.write("**Log del parser:**")
+            if pdf_debug_log:
+                for msg in pdf_debug_log:
+                    st.code(msg)
+            st.write(f"**Líneas detectadas del PDF: {len(pdf_lineas) if pdf_lineas else 0}**")
+            if pdf_lineas:
+                st.dataframe(pd.DataFrame(pdf_lineas), use_container_width=True, hide_index=True)
+            st.write("**Texto extraído (primeras 60 líneas):**")
+            if pdf_debug_texto:
+                lineas_preview = pdf_debug_texto.splitlines()[:60]
+                st.code("\n".join(f"{i:3d}: {l}" for i, l in enumerate(lineas_preview) if l.strip()))
+
         if diferencias:
             st.markdown("#### 📋 Tabla completa de diferencias")
             st.dataframe(pd.DataFrame(diferencias), use_container_width=True, hide_index=True)
@@ -601,17 +730,23 @@ if json_files and pdf_files:
             texto    = extraer_texto_pdf(f.read())
             cabecera = parsear_cabecera_pdf(texto)
             importes = extraer_importes_pdf(texto)
-            lineas   = parsear_lineas_pdf(texto)
+            debug_log = []
+            lineas   = parsear_lineas_pdf(texto, debug_log=debug_log)
             pedido   = cabecera["pedido"]
             if pedido:
-                pdfs[pedido] = ({
-                    "pedido":  pedido,
-                    "cliente": cabecera["cliente"],
-                    "tienda":  cabecera["tienda"],
-                    "importe": importes["importe"],
-                    "iva":     importes["iva"],
-                    "total":   importes["total"],
-                }, lineas)
+                pdfs[pedido] = (
+                    {
+                        "pedido":  pedido,
+                        "cliente": cabecera["cliente"],
+                        "tienda":  cabecera["tienda"],
+                        "importe": importes["importe"],
+                        "iva":     importes["iva"],
+                        "total":   importes["total"],
+                    },
+                    lineas,
+                    texto,       # para depuración
+                    debug_log,   # para depuración
+                )
             else:
                 st.warning(f"⚠️ {f.name} no tiene número de pedido reconocible.")
         except Exception as e:
@@ -639,7 +774,7 @@ if json_files and pdf_files:
 
     for pedido in emparejados:
         json_resumen, json_lineas = jsons[pedido]
-        pdf_resumen,  pdf_lineas  = pdfs[pedido]
+        pdf_resumen, pdf_lineas, pdf_texto, pdf_log = pdfs[pedido]
         difs, criticas, avisos, comparacion_id = comparar_par(json_resumen, json_lineas, pdf_resumen, pdf_lineas)
         total_crit += len(criticas)
         total_avis += len(avisos)
@@ -649,6 +784,9 @@ if json_files and pdf_files:
             json_resumen, pdf_resumen,
             difs, criticas, avisos,
             comparacion_id,
+            pdf_debug_texto=pdf_texto,
+            pdf_debug_log=pdf_log,
+            pdf_lineas=pdf_lineas,
         )
 
     st.markdown("---")
