@@ -116,7 +116,7 @@ def parsear_json(data):
 
 
 # =========================================================
-# PARSEAR PDF  (parser nuevo: detecta líneas POS reales)
+# PARSEAR PDF
 # =========================================================
 
 def extraer_texto_pdf(pdf_bytes):
@@ -162,16 +162,13 @@ def extraer_importes_pdf(texto):
     return {"importe": None, "iva": None, "total": None}
 
 
-# Línea POS típica del PDF: "1 1 ME2P40CX" / "6 14 Complemento" / "3 1 Puerta"
+# Línea POS del PDF: "1 1 ME2P40CX" / "6 14 Complemento" / "3 1 Puerta"
 # Estructura: POS(num) CANTIDAD(num) REFERENCIA(resto)
 RE_POS_LINEA = re.compile(r"^(\d{1,3})\s+(\d{1,4})\s+(.+)$")
 
 
 def es_linea_pos(linea):
-    """
-    Detecta si una línea es la cabecera de una POS de producto.
-    Devuelve (pos, cantidad, referencia) o None.
-    """
+    """Detecta cabecera de POS. Devuelve (pos, cantidad, referencia) o None."""
     if linea.upper().startswith("POS MUEBLE"):
         return None
     m = RE_POS_LINEA.match(linea)
@@ -185,10 +182,13 @@ def es_linea_pos(linea):
 
 
 def extraer_datos_bloque_pdf(bloque_texto):
-    """Del texto del bloque de una POS, extrae (x, y, z, opening)."""
+    """Extrae (x, y, z, opening) del texto del bloque de una POS."""
     size_x = size_y = size_z = None
     opening = ""
-    m = re.search(r"L\s*:\s*(\d+)\s*F\s*:\s*(\d+)\s*A\s*:\s*(\d+)", bloque_texto, flags=re.IGNORECASE)
+    m = re.search(
+        r"L\s*:\s*(\d+)\s*F\s*:\s*(\d+)\s*A\s*:\s*(\d+)",
+        bloque_texto, flags=re.IGNORECASE,
+    )
     if m:
         size_x = convertir_a_int(m.group(1))
         size_y = convertir_a_int(m.group(2))
@@ -201,13 +201,8 @@ def extraer_datos_bloque_pdf(bloque_texto):
 
 def parsear_lineas_pdf(texto):
     """
-    Recorre las líneas del PDF. Para cada línea POS detectada,
-    agrupa las siguientes líneas hasta la próxima POS (o EOF) y extrae:
-      - pos, cantidad, referencia
-      - descripcion (primera línea útil)
-      - size_x, size_y, size_z
-      - opening
-      - importe (primer número \\d+\\.\\d{2} del bloque)
+    Detecta cada línea POS y agrupa las siguientes hasta la próxima POS (o EOF).
+    Extrae: referencia, cantidad, descripción, tamaño, opening e importe.
     """
     lineas = limpiar_lineas(texto)
 
@@ -224,7 +219,7 @@ def parsear_lineas_pdf(texto):
         bloque_lineas = lineas[idx + 1: fin]
         bloque_texto  = " ".join(bloque_lineas)
 
-        # Descripción: primera línea útil (no tamaño/opening/variantes/observaciones/importe)
+        # Descripción: primera línea útil del bloque
         descripcion = ""
         for l in bloque_lineas:
             if re.match(r"^L\s*:", l, flags=re.IGNORECASE): continue
@@ -261,10 +256,7 @@ def parsear_lineas_pdf(texto):
 
 
 def indexar_por_referencia(lineas):
-    """
-    Indexa por referencia. Si hay duplicadas (p.ej. ME2P40CX izq y dcha),
-    deja la primera — los detalles finos se resuelven en la comparación por ID.
-    """
+    """Indexa por referencia (primera ocurrencia). El detalle fino va por id."""
     refs = {}
     for item in lineas:
         ref = limpiar_upper(item.get("reference", ""))
@@ -273,14 +265,15 @@ def indexar_por_referencia(lineas):
     return refs
 
 
-# Emparejar por id con prioridad: ref+opening → ref+tamaño → solo ref
 def emparejar_lineas_por_id(json_lineas, pdf_lineas):
     """
-    Devuelve:
-      - lista de tuplas (json_line, pdf_line_or_None)
-      - lista de líneas PDF que se han quedado sin pareja
+    Empareja por id con prioridad:
+      1. referencia + opening
+      2. referencia + tamaño exacto
+      3. solo referencia
+    Devuelve lista de tuplas (json_line, pdf_line_or_None) y huérfanos PDF.
     """
-    pdf_disponibles = list(pdf_lineas)  # copia
+    pdf_disponibles = list(pdf_lineas)
     emparejados = []
 
     def quitar(pdf_item):
@@ -296,7 +289,7 @@ def emparejar_lineas_por_id(json_lineas, pdf_lineas):
 
         candidato = None
 
-        # Prioridad 1: referencia + opening
+        # 1. referencia + opening
         if opn_j:
             for p in pdf_disponibles:
                 if (limpiar_upper(p.get("reference")) == ref_j
@@ -304,7 +297,7 @@ def emparejar_lineas_por_id(json_lineas, pdf_lineas):
                     candidato = p
                     break
 
-        # Prioridad 2: referencia + tamaño exacto
+        # 2. referencia + tamaño exacto
         if candidato is None:
             for p in pdf_disponibles:
                 if (limpiar_upper(p.get("reference")) == ref_j
@@ -314,7 +307,7 @@ def emparejar_lineas_por_id(json_lineas, pdf_lineas):
                     candidato = p
                     break
 
-        # Prioridad 3: solo referencia (primero que aparezca)
+        # 3. solo referencia (primero que aparezca)
         if candidato is None:
             for p in pdf_disponibles:
                 if limpiar_upper(p.get("reference")) == ref_j:
@@ -396,9 +389,11 @@ def comparar_par(json_resumen, json_lineas, pdf_resumen, pdf_lineas):
 
 def comparar_por_id(json_lineas, pdf_lineas):
     """
-    Devuelve:
-      - filas_tabla: lista de dicts (una por id) con Precio JSON, Precio PDF, Dif
-      - criticas, avisos, diferencias: para la tabla general y el Excel
+    Para cada id del JSON:
+      - Lo empareja con una línea del PDF
+      - Compara tamaño (x↔L, y↔F, z↔A)
+      - Compara precio de línea (JSON.priceTotal vs PDF.importe)
+      - Marca aviso si priceTotal > UMBRAL_PRECIO_LINEA
     """
     filas_tabla = []
     criticas    = []
@@ -416,12 +411,11 @@ def comparar_por_id(json_lineas, pdf_lineas):
         precio_j = j.get("price_total")
         precio_j_str = a_euro(precio_j) if precio_j is not None else "—"
 
-        # Aviso de precio elevado (independiente del emparejamiento)
         precio_elevado = precio_j is not None and precio_j > UMBRAL_PRECIO_LINEA
 
         if p is None:
             # Sin pareja en PDF
-            fila = {
+            filas_tabla.append({
                 "ID":          id_json,
                 "Referencia":  ref,
                 "Nombre":      nombre + (f" ({opening})" if opening else ""),
@@ -431,8 +425,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
                 "Precio PDF":  "—",
                 "Dif. precio": "—",
                 "Estado":      "🔴 Sin pareja en PDF",
-            }
-            filas_tabla.append(fila)
+            })
             criticas.append({
                 "Campo": f"ID {id_json} ({ref})",
                 "JSON": f"{ref} {tam_json}",
@@ -452,7 +445,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
             precio_p = convertir_a_float(p.get("importe_linea"))
             precio_p_str = a_euro(precio_p) if precio_p is not None else "—"
 
-            # Diferencia de precio
+            # Diferencia de precio (PDF - JSON)
             if precio_j is not None and precio_p is not None:
                 dif_precio = round(precio_p - precio_j, 2)
                 dif_precio_str = a_euro(dif_precio)
@@ -460,7 +453,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
                 dif_precio = None
                 dif_precio_str = "—"
 
-            # Comparar cada eje
+            # Comparar cada eje del tamaño
             diffs_ejes = []
             for eje, vj, vp in [
                 ("x/L", j.get("size_x"), p.get("size_x")),
@@ -471,18 +464,18 @@ def comparar_por_id(json_lineas, pdf_lineas):
                     diffs_ejes.append(f"{eje}: JSON={vj} / PDF={vp}")
 
             # Estado de la fila
-            motivos_rojo = []
+            motivos = []
             if diffs_ejes:
-                motivos_rojo.append("tamaño")
+                motivos.append("tamaño")
             if dif_precio is not None and dif_precio != 0:
-                motivos_rojo.append("precio")
+                motivos.append("precio")
 
-            if motivos_rojo:
-                estado = "🔴 " + " + ".join(motivos_rojo).capitalize() + " distinto"
+            if motivos:
+                estado = "🔴 " + " + ".join(motivos).capitalize() + " distinto"
             else:
                 estado = "🟢 OK"
 
-            # Diferencias de tamaño → críticas
+            # Registrar diferencias de tamaño como críticas
             if diffs_ejes:
                 detalle = " · ".join(diffs_ejes)
                 criticas.append({
@@ -500,7 +493,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
                     "Qué corregir": f"Tamaño distinto en {ref}: {detalle}",
                 })
 
-            # Diferencias de precio de línea → críticas
+            # Registrar diferencias de precio de línea como críticas
             if dif_precio is not None and dif_precio != 0:
                 criticas.append({
                     "Campo": f"Precio línea — {id_json} ({ref})",
@@ -529,7 +522,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
                 "Estado":      estado,
             })
 
-        # Aviso por precio > umbral (no depende de si hay pareja o no)
+        # Aviso por precio elevado (independiente del emparejamiento)
         if precio_elevado:
             avisos.append({
                 "Campo": f"Precio elevado — {id_json} ({ref})",
