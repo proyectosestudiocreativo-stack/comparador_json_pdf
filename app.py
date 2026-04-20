@@ -76,16 +76,30 @@ UMBRAL_PRECIO_LINEA = 4000.0
 # =========================================================
 
 def parsear_json(data):
-    # Comparación honesta con el PDF: leemos los campos tal cual vienen en el JSON.
-    # Si hay diferencia con el PDF, la app debe mostrarla, NO corregirla.
+    # Campos de cabecera:
+    #  - "importe" del JSON = suma de muebles (aparece también en el PDF como IMPORTE)
+    #  - "ivaCabinetsPorcentaje" = 21% del importe de muebles (aparece en PDF como "I.V.A. 21% en muebles")
+    #  - El Total que aparece en el PDF = IMPORTE + I.V.A. de muebles
+    # Los campos "iva" y "total" del JSON suman IVAs de otras categorías (encimeras, electrodomésticos,
+    # equipamientos) que NO salen en este PDF, por eso no los usamos aquí.
+    importe_json = convertir_a_float(data.get("importe", 0))
+    iva_json     = convertir_a_float(data.get("ivaCabinetsPorcentaje"))
+    if iva_json is None:
+        iva_json = convertir_a_float(data.get("iva", 0))  # fallback
+
+    if importe_json is not None and iva_json is not None:
+        total_json = round(importe_json + iva_json, 2)
+    else:
+        total_json = convertir_a_float(data.get("total", 0))  # fallback
+
     resumen = {
         "pedido":   limpiar_texto(data.get("orderCode", "")),
         "cliente":  limpiar_texto(data.get("customerName", "")),
         "tienda":   limpiar_texto(data.get("storeName", "")),
         "proyecto": limpiar_texto(data.get("projectName", "")),
-        "importe":  convertir_a_float(data.get("importe", 0)),
-        "iva":      convertir_a_float(data.get("iva", 0)),
-        "total":    convertir_a_float(data.get("total", 0)),
+        "importe":  importe_json,
+        "iva":      iva_json,
+        "total":    total_json,
     }
     lineas = []
     for item in data.get("cabinets", []):
@@ -631,22 +645,19 @@ def comparar_por_id(json_lineas, pdf_lineas):
             # --- Comparación de cantidad ---
             cant_distinta = son_numeros_distintos(cant_j, cant_p)
 
-            # --- Comparación de materiales ---
-            # Compara solo los campos de material que tienen valor en JSON Y PDF
-            # Lista de (etiqueta, valor_json, valor_pdf)
-            comparaciones_mat = [
-                ("Modelo puerta",   j.get("model_door"),       p.get("model_door")),
-                ("Material puerta", j.get("material_door"),    p.get("material_door")),
-                ("Armazón",         j.get("material_cabinet"), p.get("material_cabinet")),
-                ("Acabado",         j.get("material"),         p.get("material")),
-            ]
-            diffs_mat = []
-            for etiqueta, vj, vp in comparaciones_mat:
-                vjn = limpiar_upper(vj)
-                vpn = limpiar_upper(vp)
-                # Solo comparamos si AMBOS lados tienen valor (no inventamos avisos falsos)
-                if vjn and vpn and vjn != vpn:
-                    diffs_mat.append(f"{etiqueta}: JSON={vj!r} / PDF={vp!r}")
+            # --- Comparación de materiales por concepto ---
+            # El JSON y el PDF etiquetan los mismos datos con nombres distintos según el tipo
+            # de mueble. Comparamos por CONCEPTO, no por nombre de campo:
+            #   1) "Frente/Puerta": lo que da color a la cara visible del mueble.
+            #      JSON: model_door / material_door  ↔  PDF: model_door / material_door
+            #   2) "Armazón": la estructura del mueble.
+            #      JSON: material_cabinet  ↔  PDF: material_cabinet
+            #   3) "Acabado": material único de complementos/zócalos/costados.
+            #      JSON: material  ↔  PDF: material
+            #   Si el JSON trae el material en el campo "material" y el PDF lo trae como
+            #   "material_door" (porque el PDF lo etiqueta "Frente"), ambos son conceptualmente
+            #   el mismo dato y hay que compararlos así.
+            diffs_mat = _comparar_materiales(j, p)
 
             # --- Estado resumen ---
             motivos = []
@@ -783,6 +794,84 @@ def _resumir_materiales_pdf(linea):
     if linea.get("material") and not partes:
         partes.append(f"Acabado: {linea['material']}")
     return " | ".join(partes) if partes else "—"
+
+
+def _concepto_material_json(linea):
+    """
+    Devuelve un dict con los materiales del JSON normalizados por CONCEPTO:
+    - 'frente': el material de la cara visible (puerta o frente)
+    - 'modelo_frente': el modelo (cuando aplica, solo para puertas)
+    - 'armazon': el material del armazón
+    - 'acabado_unico': si el mueble no tiene frente+armazón, solo un material único
+    """
+    material_door    = limpiar_upper(linea.get("material_door"))
+    model_door       = limpiar_upper(linea.get("model_door"))
+    material_cabinet = limpiar_upper(linea.get("material_cabinet"))
+    material_generico = limpiar_upper(linea.get("material"))
+
+    # Si el JSON trae material_door → es una puerta/frente (con o sin modelo)
+    frente = material_door
+    modelo = model_door if material_door else ""
+
+    armazon = material_cabinet
+
+    # "Acabado único" solo si no hay frente ni armazón (complementos/costados/zócalos)
+    # En esos casos el JSON pone el dato en "material".
+    acabado_unico = ""
+    if not frente and not armazon:
+        acabado_unico = material_generico
+
+    return {"frente": frente, "modelo_frente": modelo,
+            "armazon": armazon, "acabado_unico": acabado_unico}
+
+
+def _concepto_material_pdf(linea):
+    """Igual que la de JSON pero para el PDF."""
+    material_door    = limpiar_upper(linea.get("material_door"))
+    model_door       = limpiar_upper(linea.get("model_door"))
+    material_cabinet = limpiar_upper(linea.get("material_cabinet"))
+    material_generico = limpiar_upper(linea.get("material"))
+
+    frente = material_door
+    modelo = model_door if material_door else ""
+
+    armazon = material_cabinet
+
+    acabado_unico = ""
+    if not frente and not armazon:
+        acabado_unico = material_generico
+
+    return {"frente": frente, "modelo_frente": modelo,
+            "armazon": armazon, "acabado_unico": acabado_unico}
+
+
+def _comparar_materiales(json_linea, pdf_linea):
+    """
+    Compara materiales entre JSON y PDF por CONCEPTO (frente, armazón, acabado único).
+    Solo marca como diferencia si ambos lados aportan ese concepto y no coinciden.
+    Devuelve lista de strings describiendo las diferencias.
+    """
+    cj = _concepto_material_json(json_linea)
+    cp = _concepto_material_pdf(pdf_linea)
+    diffs = []
+
+    # Frente (color/material de la cara del mueble)
+    if cj["frente"] and cp["frente"] and cj["frente"] != cp["frente"]:
+        diffs.append(f"Frente/Puerta: JSON={json_linea.get('material_door')!r} / PDF={pdf_linea.get('material_door')!r}")
+
+    # Modelo del frente (solo si JSON y PDF tienen MODELO, no solo material)
+    if cj["modelo_frente"] and cp["modelo_frente"] and cj["modelo_frente"] != cp["modelo_frente"]:
+        diffs.append(f"Modelo frente: JSON={json_linea.get('model_door')!r} / PDF={pdf_linea.get('model_door')!r}")
+
+    # Armazón
+    if cj["armazon"] and cp["armazon"] and cj["armazon"] != cp["armazon"]:
+        diffs.append(f"Armazón: JSON={json_linea.get('material_cabinet')!r} / PDF={pdf_linea.get('material_cabinet')!r}")
+
+    # Acabado único (complementos, costados, zócalos): comparamos solo si AMBOS lo traen
+    if cj["acabado_unico"] and cp["acabado_unico"] and cj["acabado_unico"] != cp["acabado_unico"]:
+        diffs.append(f"Acabado: JSON={json_linea.get('material')!r} / PDF={pdf_linea.get('material')!r}")
+
+    return diffs
 
 
 # =========================================================
