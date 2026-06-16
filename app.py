@@ -48,6 +48,20 @@ def a_euro(valor):
         return ""
     return f"{num:.2f} €"
 
+
+def convertir_a_num(valor):
+    """Convierte un valor numérico devolviendo int si es entero, o float si tiene decimales.
+    Útil para tamaños del PDF/Excel que pueden ser '400' o '35.2'."""
+    try:
+        f = float(str(valor).replace(",", ".").strip())
+        # Si es entero exacto, devolver int para mostrar '400' en vez de '400.0'
+        if f == int(f):
+            return int(f)
+        # Si tiene decimales reales, redondear a 2 para evitar floats sucios
+        return round(f, 2)
+    except:
+        return None
+
 def crear_excel_en_memoria(df):
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -104,9 +118,9 @@ def parsear_json(data):
     lineas = []
     for item in data.get("cabinets", []):
         size = item.get("size") or {}
-        size_x = convertir_a_int(size.get("x"))
-        size_y = convertir_a_int(size.get("y"))
-        size_z = convertir_a_int(size.get("z"))
+        size_x = convertir_a_num(size.get("x"))
+        size_y = convertir_a_num(size.get("y"))
+        size_z = convertir_a_num(size.get("z"))
 
         price_total = convertir_a_float(item.get("priceTotal"))
         if price_total is None:
@@ -288,7 +302,7 @@ def _parsear_estrategia_C_ref_por_patron(lineas):
             continue
         # Comprobar que en las 15 líneas siguientes hay un patrón L:.. F:.. A:..
         siguiente_15 = " ".join(lineas[idx+1: idx+16])
-        if not re.search(r"L\s*:\s*\d+.*F\s*:\s*\d+.*A\s*:\s*\d+", siguiente_15, re.IGNORECASE):
+        if not re.search(r"L\s*:\s*\d+(?:\.\d+)?.*F\s*:\s*\d+(?:\.\d+)?.*A\s*:\s*\d+(?:\.\d+)?", siguiente_15, re.IGNORECASE):
             continue
         indices_pos.append((idx, "?", "?", linea))
     return indices_pos
@@ -309,11 +323,11 @@ def extraer_datos_bloque_pdf(bloque_lineas):
     for linea in bloque_lineas:
         # Tamaño: "L: 400 F: 600 A: 2250"
         if size_x is None:
-            m = re.search(r"L\s*:\s*(\d+)\s*F\s*:\s*(\d+)\s*A\s*:\s*(\d+)", linea, flags=re.IGNORECASE)
+            m = re.search(r"L\s*:\s*(\d+(?:\.\d+)?)\s*F\s*:\s*(\d+(?:\.\d+)?)\s*A\s*:\s*(\d+(?:\.\d+)?)", linea, flags=re.IGNORECASE)
             if m:
-                size_x = convertir_a_int(m.group(1))
-                size_y = convertir_a_int(m.group(2))
-                size_z = convertir_a_int(m.group(3))
+                size_x = convertir_a_num(m.group(1))
+                size_y = convertir_a_num(m.group(2))
+                size_z = convertir_a_num(m.group(3))
                 continue
 
         # Apertura: "M: Izquierda" / "M: Derecha"
@@ -503,6 +517,292 @@ def formatear_tamano(x, y, z):
     def f(v):
         return str(v) if v is not None else "?"
     return f"{f(x)}×{f(y)}×{f(z)}"
+
+
+# =========================================================
+# PARSEAR EXCEL  (modo Excel ↔ PDF)
+# =========================================================
+
+def extraer_pedido_del_nombre(nombre_archivo):
+    """Busca un número de pedido de 14 dígitos que empieza por 20 en el nombre del archivo."""
+    m = re.search(r"\b(20\d{12})\b", nombre_archivo or "")
+    return m.group(1) if m else ""
+
+
+def parsear_excel(bytes_excel, nombre_archivo):
+    """
+    Lee el Excel que entrega el sistema. Estructura observada:
+      Col 1: número de orden (1, 2, 3...)
+      Col 2: referencia (ej. ME2P40CX, RM230, CSM2)
+      Col 3: descripción
+      Col 4: tamaño x  (largo, mm)
+      Col 5: tamaño y  (fondo, mm)
+      Col 6: tamaño z  (alto, mm)
+      Col 7: precio UNITARIO
+    No tiene cabecera de tabla ni datos de cliente / pedido.
+    El número de pedido se saca del nombre del archivo.
+    """
+    import openpyxl
+    from io import BytesIO
+
+    wb = openpyxl.load_workbook(BytesIO(bytes_excel), data_only=True)
+    # Tomamos la primera hoja (es lo único que trae el Excel observado)
+    ws = wb[wb.sheetnames[0]]
+
+    lineas = []
+    contador_id = 0
+    for r in range(1, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, 8)]
+        ref = vals[1]
+        if ref is None or not str(ref).strip():
+            continue
+        contador_id += 1
+        lineas.append({
+            "id":          f"xls_{contador_id}",
+            "reference":   limpiar_texto(ref),
+            "name":        limpiar_texto(vals[2]) if vals[2] is not None else "",
+            "quantity":    None,            # el Excel no trae cantidad
+            "total_linea": None,            # el Excel no trae importe total
+            "observation": "",
+            "opening":     "",              # tampoco trae opening
+            "size_x":      convertir_a_num(vals[3]),
+            "size_y":      convertir_a_num(vals[4]),
+            "size_z":      convertir_a_num(vals[5]),
+            "price_total": None,            # se rellena más abajo a partir de unidades * unitario
+            "price_unit":  convertir_a_float(vals[6]),  # precio unitario que sí trae el Excel
+        })
+
+    resumen = {
+        "pedido":   extraer_pedido_del_nombre(nombre_archivo),
+        "cliente":  "",       # el Excel no trae cliente
+        "tienda":   "",
+        "proyecto": "",
+        "importe":  None,
+        "iva":      None,
+        "total":    None,
+    }
+    return resumen, lineas
+
+
+# =========================================================
+# COMPARAR EXCEL ↔ PDF (modo específico)
+# =========================================================
+
+def comparar_excel_pdf(xls_resumen, xls_lineas, pdf_resumen, pdf_lineas):
+    """
+    Comparación específica Excel ↔ PDF.
+
+    Lo que SÍ compara:
+      - Que la lista de referencias del Excel y del PDF coincidan.
+      - Que para cada línea emparejada el tamaño (x↔L, y↔F, z↔A) coincida.
+      - Que el precio UNITARIO del Excel = importe_PDF / unidades_PDF.
+
+    Lo que NO compara (porque el Excel no lo trae):
+      - Cantidad (no está en el Excel)
+      - Cabecera (importe, IVA, total, cliente, tienda)
+      - Materiales / acabados
+    """
+    diferencias = []
+    criticas    = []
+    avisos      = []
+
+    # Verificamos solo que el pedido del nombre del Excel = pedido del PDF
+    # (esto en la práctica ya está garantizado por el emparejamiento, pero lo dejamos)
+    if (xls_resumen.get("pedido") and pdf_resumen.get("pedido")
+            and xls_resumen["pedido"] != pdf_resumen["pedido"]):
+        criticas.append({
+            "Campo": "Pedido", "JSON": xls_resumen["pedido"], "PDF": pdf_resumen["pedido"],
+            "Diferencia": "",
+            "Qué corregir": "El número de pedido del Excel no coincide con el del PDF.",
+        })
+        diferencias.append({
+            "Gravedad": "🔴 Crítico", "Tipo": "Cabecera", "Campo": "Pedido",
+            "Referencia": "CABECERA",
+            "Valor JSON": xls_resumen["pedido"], "Valor PDF": pdf_resumen["pedido"],
+            "Diferencia": "",
+            "Qué corregir": "Pedidos diferentes en Excel y PDF.",
+        })
+
+    # Comparación por id (reutilizamos el emparejador del modo JSON)
+    filas_tabla, criticas_id, avisos_id, diferencias_id = _comparar_por_id_xls(xls_lineas, pdf_lineas)
+    criticas.extend(criticas_id)
+    avisos.extend(avisos_id)
+    diferencias.extend(diferencias_id)
+
+    # Avisar de POS del PDF que se hayan quedado sin pareja en el Excel
+    emparejados, huerfanos_pdf = emparejar_lineas_por_id(xls_lineas, pdf_lineas)
+    for p in huerfanos_pdf:
+        ref = p.get("reference") or ""
+        avisos.append({
+            "Campo": f"Extra en PDF — POS {p.get('pos')} ({ref})",
+            "JSON": "—", "PDF": ref, "Diferencia": "",
+            "Qué corregir": f"La línea POS {p.get('pos')} ({ref}) del PDF no aparece en el Excel.",
+        })
+        diferencias.append({
+            "Gravedad": "🟡 Aviso", "Tipo": "Línea",
+            "Campo": "Solo en PDF", "Referencia": ref,
+            "Valor JSON": "", "Valor PDF": f"POS {p.get('pos')} — {ref}",
+            "Diferencia": "",
+            "Qué corregir": f"POS {p.get('pos')} ({ref}) está en PDF pero no en Excel.",
+        })
+
+    return diferencias, criticas, avisos, filas_tabla
+
+
+def _comparar_por_id_xls(xls_lineas, pdf_lineas):
+    """
+    Versión específica de comparar_por_id para el modo Excel↔PDF.
+    Compara solo lo que el Excel sí trae: tamaño y precio unitario.
+    """
+    filas_tabla = []
+    criticas    = []
+    avisos      = []
+    diferencias = []
+
+    emparejados, _ = emparejar_lineas_por_id(xls_lineas, pdf_lineas)
+
+    for j, p in emparejados:
+        id_xls   = j.get("id") or "—"
+        ref      = j.get("reference") or "—"
+        nombre   = j.get("name") or "—"
+        tam_xls  = formatear_tamano(j.get("size_x"), j.get("size_y"), j.get("size_z"))
+        precio_u_xls = j.get("price_unit")
+        precio_u_xls_str = a_euro(precio_u_xls) if precio_u_xls is not None else "—"
+
+        precio_elevado = precio_u_xls is not None and precio_u_xls > UMBRAL_PRECIO_LINEA
+
+        if p is None:
+            filas_tabla.append({
+                "Ref":              ref,
+                "Nombre":           nombre,
+                "Tamaño Excel":     tam_xls,
+                "Tamaño PDF":       "—",
+                "Precio U. Excel":  precio_u_xls_str + (" ⚠️" if precio_elevado else ""),
+                "Ud. PDF":          "—",
+                "Importe PDF":      "—",
+                "Precio U. PDF":    "—",
+                "Dif. precio":      "—",
+                "Estado":           "🔴 Sin pareja en PDF",
+            })
+            criticas.append({
+                "Campo": f"Ref {ref}",
+                "JSON": f"{ref} {tam_xls}",
+                "PDF": "—",
+                "Diferencia": "",
+                "Qué corregir": f"La referencia {ref} ({tam_xls}) está en el Excel pero no se ha encontrado en el PDF.",
+            })
+            diferencias.append({
+                "Gravedad": "🔴 Crítico", "Tipo": "Línea",
+                "Campo": "Sin pareja PDF", "Referencia": ref,
+                "Valor JSON": tam_xls, "Valor PDF": "",
+                "Diferencia": "",
+                "Qué corregir": f"{ref} en Excel no tiene pareja en el PDF.",
+            })
+            continue
+
+        tam_pdf  = formatear_tamano(p.get("size_x"), p.get("size_y"), p.get("size_z"))
+        ud_pdf   = p.get("quantity")
+        imp_pdf  = convertir_a_float(p.get("importe_linea"))
+
+        # Precio unitario del PDF = importe / unidades
+        if imp_pdf is not None and ud_pdf is not None and ud_pdf != 0:
+            precio_u_pdf = round(imp_pdf / ud_pdf, 2)
+        else:
+            precio_u_pdf = None
+        precio_u_pdf_str = a_euro(precio_u_pdf) if precio_u_pdf is not None else "—"
+
+        # Diferencia (PDF - Excel)
+        if precio_u_xls is not None and precio_u_pdf is not None:
+            dif = round(precio_u_pdf - precio_u_xls, 2)
+            dif_str = a_euro(dif)
+        else:
+            dif = None
+            dif_str = "—"
+
+        # Tamaño: comparar con tolerancia mínima por decimales
+        diffs_ejes = []
+        for eje, vj, vp in [("x/L", j.get("size_x"), p.get("size_x")),
+                             ("y/F", j.get("size_y"), p.get("size_y")),
+                             ("z/A", j.get("size_z"), p.get("size_z"))]:
+            if vj is None or vp is None:
+                if vj != vp:
+                    diffs_ejes.append(f"{eje}: Excel={vj} / PDF={vp}")
+            else:
+                # Tolerancia de 0.5 mm por si hay redondeos en el PDF
+                if abs(float(vj) - float(vp)) > 0.5:
+                    diffs_ejes.append(f"{eje}: Excel={vj} / PDF={vp}")
+
+        # Estado
+        motivos = []
+        if diffs_ejes:                            motivos.append("tamaño")
+        if dif is not None and abs(dif) > 0.01:   motivos.append("precio")
+
+        estado = "🔴 " + " + ".join(motivos).capitalize() + " distinto" if motivos else "🟢 OK"
+
+        # Registrar diferencias
+        if diffs_ejes:
+            detalle = " · ".join(diffs_ejes)
+            criticas.append({
+                "Campo": f"Tamaño — {ref}",
+                "JSON": tam_xls, "PDF": tam_pdf,
+                "Diferencia": detalle,
+                "Qué corregir": f"Tamaño distinto en {ref}: {detalle}",
+            })
+            diferencias.append({
+                "Gravedad": "🔴 Crítico", "Tipo": "Línea",
+                "Campo": "Tamaño", "Referencia": ref,
+                "Valor JSON": tam_xls, "Valor PDF": tam_pdf,
+                "Diferencia": detalle,
+                "Qué corregir": f"Tamaño distinto en {ref}: {detalle}",
+            })
+
+        if dif is not None and abs(dif) > 0.01:
+            criticas.append({
+                "Campo": f"Precio unitario — {ref}",
+                "JSON": precio_u_xls_str, "PDF": precio_u_pdf_str,
+                "Diferencia": dif_str,
+                "Qué corregir": f"Precio unitario distinto en {ref}: Excel={precio_u_xls_str} / PDF={precio_u_pdf_str} (Dif: {dif_str})",
+            })
+            diferencias.append({
+                "Gravedad": "🔴 Crítico", "Tipo": "Línea",
+                "Campo": "Precio unitario", "Referencia": ref,
+                "Valor JSON": precio_u_xls_str, "Valor PDF": precio_u_pdf_str,
+                "Diferencia": dif_str,
+                "Qué corregir": f"Precio unitario distinto en {ref}.",
+            })
+
+        ud_pdf_str = str(int(ud_pdf)) if ud_pdf is not None and ud_pdf == int(ud_pdf) else (str(ud_pdf) if ud_pdf is not None else "—")
+        imp_pdf_str = a_euro(imp_pdf) if imp_pdf is not None else "—"
+
+        filas_tabla.append({
+            "Ref":              ref,
+            "Nombre":           nombre,
+            "Tamaño Excel":     tam_xls,
+            "Tamaño PDF":       tam_pdf,
+            "Precio U. Excel":  precio_u_xls_str + (" ⚠️" if precio_elevado else ""),
+            "Ud. PDF":          ud_pdf_str,
+            "Importe PDF":      imp_pdf_str,
+            "Precio U. PDF":    precio_u_pdf_str,
+            "Dif. precio":      dif_str,
+            "Estado":           estado,
+        })
+
+        if precio_elevado:
+            avisos.append({
+                "Campo": f"Precio elevado — {ref}",
+                "JSON": precio_u_xls_str, "PDF": "",
+                "Diferencia": "",
+                "Qué corregir": f"El precio unitario de {ref} es {precio_u_xls_str} (> {UMBRAL_PRECIO_LINEA:.0f} €). Revisar.",
+            })
+            diferencias.append({
+                "Gravedad": "🟡 Aviso", "Tipo": "Línea",
+                "Campo": "Precio elevado (>4000 €)", "Referencia": ref,
+                "Valor JSON": precio_u_xls_str, "Valor PDF": "",
+                "Diferencia": "",
+                "Qué corregir": f"Precio unitario {precio_u_xls_str} supera el umbral.",
+            })
+
+    return filas_tabla, criticas, avisos, diferencias
 
 
 # =========================================================
@@ -815,16 +1115,58 @@ def mostrar_resultado(pedido, cliente, json_resumen, pdf_resumen, diferencias, c
 # INTERFAZ PRINCIPAL
 # =========================================================
 
-st.title("📋 Comparador PDF vs JSON — Múltiples clientes")
-st.write("Sube todos los JSON y todos los PDF de golpe. La app los empareja automáticamente por número de pedido.")
+st.title("📋 Comparador de pedidos vs PDF")
+st.write("Sube los archivos y la app los empareja automáticamente por número de pedido.")
 
+# ---------- Selector de modo ----------
+modo = st.radio(
+    "**Tipo de comparación:**",
+    options=["📂 JSON ↔ PDF", "📊 Excel ↔ PDF"],
+    horizontal=True,
+    help="JSON ↔ PDF: ficheros internos. Excel ↔ PDF: el Excel del sistema (debe llamarse con el número de pedido, ej. '20260430473073.xls')."
+)
+
+modo_excel = modo.startswith("📊")
+
+st.markdown("---")
+
+# ---------- Uploaders ----------
 col1, col2 = st.columns(2)
-with col1:
-    json_files = st.file_uploader("📂 Archivos JSON", type=["json"], accept_multiple_files=True)
-with col2:
-    pdf_files  = st.file_uploader("📄 Archivos PDF",  type=["pdf"],  accept_multiple_files=True)
 
-if json_files and pdf_files:
+if modo_excel:
+    with col1:
+        xls_files = st.file_uploader(
+            "📊 Archivos Excel (el nombre debe ser el número de pedido)",
+            type=["xls", "xlsx"],
+            accept_multiple_files=True,
+        )
+    with col2:
+        pdf_files = st.file_uploader(
+            "📄 Archivos PDF",
+            type=["pdf"],
+            accept_multiple_files=True,
+        )
+    json_files = None
+else:
+    with col1:
+        json_files = st.file_uploader(
+            "📂 Archivos JSON",
+            type=["json"],
+            accept_multiple_files=True,
+        )
+    with col2:
+        pdf_files = st.file_uploader(
+            "📄 Archivos PDF",
+            type=["pdf"],
+            accept_multiple_files=True,
+        )
+    xls_files = None
+
+
+# =====================================================
+# MODO JSON ↔ PDF
+# =====================================================
+if not modo_excel and json_files and pdf_files:
     st.markdown("---")
 
     jsons = {}
@@ -859,8 +1201,8 @@ if json_files and pdf_files:
                         "total":   importes["total"],
                     },
                     lineas,
-                    texto,       # para depuración
-                    debug_log,   # para depuración
+                    texto,
+                    debug_log,
                 )
             else:
                 st.warning(f"⚠️ {f.name} no tiene número de pedido reconocible.")
@@ -903,6 +1245,150 @@ if json_files and pdf_files:
             pdf_debug_log=pdf_log,
             pdf_lineas=pdf_lineas,
         )
+
+    st.markdown("---")
+    st.markdown("### 🚦 Estado general")
+    if total_crit > 0:
+        st.markdown(f'<div class="semaforo-rojo">🔴 HAY PROBLEMAS — {total_crit} diferencia(s) crítica(s) en total</div>', unsafe_allow_html=True)
+    elif total_avis > 0:
+        st.markdown(f'<div class="semaforo-amarillo">🟡 REVISAR — {total_avis} aviso(s) en total</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="semaforo-verde">✅ TODOS LOS PEDIDOS CORRECTOS</div>', unsafe_allow_html=True)
+
+
+# =====================================================
+# MODO EXCEL ↔ PDF
+# =====================================================
+if modo_excel and xls_files and pdf_files:
+    st.markdown("---")
+
+    # Leer Excels
+    xls_dict = {}
+    for f in xls_files:
+        try:
+            contenido = f.read()
+            resumen, lineas = parsear_excel(contenido, f.name)
+            pedido = resumen["pedido"]
+            if pedido:
+                xls_dict[pedido] = (resumen, lineas, f.name)
+            else:
+                st.warning(f"⚠️ **{f.name}** — no se ha detectado un número de pedido en el nombre del archivo. "
+                           "El nombre debe contener el número de 14 dígitos (ej: `20260430473073.xls`).")
+        except Exception as e:
+            st.error(f"Error leyendo Excel {f.name}: {e}")
+
+    # Leer PDFs
+    pdfs = {}
+    for f in pdf_files:
+        try:
+            texto    = extraer_texto_pdf(f.read())
+            cabecera = parsear_cabecera_pdf(texto)
+            importes = extraer_importes_pdf(texto)
+            debug_log = []
+            lineas   = parsear_lineas_pdf(texto, debug_log=debug_log)
+            pedido   = cabecera["pedido"]
+            if pedido:
+                pdfs[pedido] = (
+                    {
+                        "pedido":  pedido,
+                        "cliente": cabecera["cliente"],
+                        "tienda":  cabecera["tienda"],
+                        "importe": importes["importe"],
+                        "iva":     importes["iva"],
+                        "total":   importes["total"],
+                    },
+                    lineas, texto, debug_log,
+                )
+            else:
+                st.warning(f"⚠️ {f.name} no tiene número de pedido reconocible.")
+        except Exception as e:
+            st.error(f"Error en {f.name}: {e}")
+
+    emparejados = sorted(set(xls_dict.keys()) & set(pdfs.keys()))
+    sin_pdf     = sorted(set(xls_dict.keys()) - set(pdfs.keys()))
+    sin_xls     = sorted(set(pdfs.keys())     - set(xls_dict.keys()))
+
+    st.markdown(f"### 📊 {len(emparejados)} pedido(s) comparado(s)")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pares encontrados", len(emparejados))
+    c2.metric("Excel sin PDF",     len(sin_pdf))
+    c3.metric("PDF sin Excel",     len(sin_xls))
+
+    for p in sin_pdf:
+        st.markdown(f'<div class="sin-pareja">⚠️ Pedido <b>{p}</b> — tiene Excel pero no se encontró su PDF</div>', unsafe_allow_html=True)
+    for p in sin_xls:
+        st.markdown(f'<div class="sin-pareja">⚠️ Pedido <b>{p}</b> — tiene PDF pero no se encontró su Excel</div>', unsafe_allow_html=True)
+
+    st.markdown("---")
+
+    total_crit = 0
+    total_avis = 0
+
+    for pedido in emparejados:
+        xls_resumen, xls_lineas, xls_nombre = xls_dict[pedido]
+        pdf_resumen, pdf_lineas, pdf_texto, pdf_log = pdfs[pedido]
+        difs, criticas, avisos, comparacion = comparar_excel_pdf(xls_resumen, xls_lineas, pdf_resumen, pdf_lineas)
+        total_crit += len(criticas)
+        total_avis += len(avisos)
+        cliente = pdf_resumen["cliente"] or "—"
+
+        n_crit, n_avis = len(criticas), len(avisos)
+        with st.expander(f"📦 Pedido {pedido} — {cliente}", expanded=(n_crit > 0)):
+            if n_crit == 0 and n_avis == 0:
+                st.markdown('<div class="semaforo-verde">✅ TODO CORRECTO</div>', unsafe_allow_html=True)
+            elif n_crit > 0:
+                st.markdown(f'<div class="semaforo-rojo">🔴 {n_crit} crítica(s) — {n_avis} aviso(s)</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(f'<div class="semaforo-amarillo">🟡 {n_avis} aviso(s) — Revisar</div>', unsafe_allow_html=True)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Cliente", cliente)
+            c2.metric("Pedido",  pedido)
+            c3.metric("Archivo Excel", xls_nombre)
+
+            if criticas:
+                st.markdown("#### 🔴 Diferencias críticas")
+                for d in criticas:
+                    extra = f" | Dif: {d['Diferencia']}" if d.get('Diferencia') else ""
+                    st.error(f"**{d['Campo']}** → Excel: `{d['JSON']}` | PDF: `{d['PDF']}`{extra}")
+                    st.caption(f"💡 {d['Qué corregir']}")
+
+            if avisos:
+                st.markdown("#### 🟡 Avisos")
+                for d in avisos:
+                    st.warning(f"**{d['Campo']}** → Excel: `{d['JSON']}` | PDF: `{d['PDF']}`")
+                    st.caption(f"💡 {d['Qué corregir']}")
+
+            if comparacion:
+                st.markdown("#### 🔍 Comparación línea a línea")
+                st.caption(
+                    "El precio unitario del Excel se compara contra el del PDF (importe ÷ unidades). "
+                    "El Excel no trae cantidad ni cabecera; eso no se compara."
+                )
+                st.dataframe(pd.DataFrame(comparacion), use_container_width=True, hide_index=True)
+
+            with st.expander("🛠️ Depuración del PDF (ábreme si algo no cuadra)"):
+                st.write("**Log del parser:**")
+                for msg in pdf_log:
+                    st.code(msg)
+                st.write(f"**Líneas detectadas del PDF: {len(pdf_lineas)}**")
+                if pdf_lineas:
+                    st.dataframe(pd.DataFrame(pdf_lineas), use_container_width=True, hide_index=True)
+                st.write("**Texto extraído (primeras 60 líneas):**")
+                lineas_preview = pdf_texto.splitlines()[:60]
+                st.code("\n".join(f"{i:3d}: {l}" for i, l in enumerate(lineas_preview) if l.strip()))
+
+            if difs:
+                st.markdown("#### 📋 Tabla completa de diferencias")
+                st.dataframe(pd.DataFrame(difs), use_container_width=True, hide_index=True)
+                excel_bytes = crear_excel_en_memoria(pd.DataFrame(difs))
+                st.download_button(
+                    label=f"📥 Descargar Excel — Pedido {pedido}",
+                    data=excel_bytes,
+                    file_name=f"diferencias_pedido_{pedido}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"excel_xls_{pedido}",
+                )
 
     st.markdown("---")
     st.markdown("### 🚦 Estado general")
