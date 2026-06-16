@@ -255,25 +255,71 @@ def _parsear_estrategia_B_pos_separada(lineas):
         1
         1
         ME2P40CX
+
+    Aceptamos también refs numéricas (como "14" que es un código real del catálogo)
+    siguiendo dos pistas:
+      - La POS debe ser SECUENCIAL (1, 2, 3...). Si rompe la secuencia esperada,
+        no es una POS real.
+      - Después del bloque (POS, qty, ref) debe haber un patrón "L: ... F: ... A: ..."
+        en las siguientes líneas (es lo que identifica un mueble).
     """
     indices_pos = []
+    pos_esperada = 1
     i = 0
     while i < len(lineas) - 2:
         l1, l2, l3 = lineas[i], lineas[i+1], lineas[i+2]
-        # l1 = número de posición (1-3 dígitos)
-        # l2 = cantidad (1-4 dígitos)
-        # l3 = referencia (no es número, no es sección, no es cabecera)
-        if (re.fullmatch(r"\d{1,3}", l1)
-                and re.fullmatch(r"\d{1,4}", l2)
-                and not re.fullmatch(r"\d+(\.\d+)?", l3)
-                and l3.upper() not in EXCLUIDOS_REF
-                and l3.upper() not in SECCIONES_VALIDAS
-                and not l3.upper().startswith("POS MUEBLE")
-                and len(l3) >= 2):
-            indices_pos.append((i, l1, l2, l3))
-            i += 3
+
+        # l1 debe ser un número de POS (1-3 dígitos) Y debe coincidir con la POS esperada
+        # (las POS van 1, 2, 3... sin saltos).
+        if not re.fullmatch(r"\d{1,3}", l1):
+            i += 1
             continue
-        i += 1
+
+        # l2 debe ser cantidad (1-4 dígitos)
+        if not re.fullmatch(r"\d{1,4}", l2):
+            i += 1
+            continue
+
+        # Comprobar que la POS encaja con la esperada
+        try:
+            pos_num = int(l1)
+        except ValueError:
+            i += 1
+            continue
+
+        if pos_num != pos_esperada:
+            i += 1
+            continue
+
+        # l3 es la referencia. Puede ser:
+        #   - Un código tipo "ME2P40CX", "RM230", "ZAL10.200" (no número puro)
+        #   - Una palabra como "Puerta", "Complemento", "Frente"
+        #   - Un número puro como "14" (sí, existe en el catálogo)
+        # No debe ser una sección ni una cabecera.
+        if (l3.upper() in EXCLUIDOS_REF
+                or l3.upper() in SECCIONES_VALIDAS
+                or l3.upper().startswith("POS MUEBLE")
+                or len(l3) < 1):
+            i += 1
+            continue
+
+        # No debe ser un importe con decimales (1234.56) → eso son precios.
+        if re.fullmatch(r"\d+\.\d{2}", l3):
+            i += 1
+            continue
+
+        # Verificar que en las siguientes ~15 líneas hay un patrón "L: ... F: ... A: ..."
+        # Esto confirma que es realmente una POS de mueble y no tres números cualesquiera.
+        siguiente = " ".join(lineas[i+3: i+18])
+        if not re.search(r"L\s*:\s*\d+(?:\.\d+)?.*F\s*:\s*\d+(?:\.\d+)?.*A\s*:\s*\d+(?:\.\d+)?",
+                          siguiente, flags=re.IGNORECASE):
+            i += 1
+            continue
+
+        # Match confirmado
+        indices_pos.append((i, l1, l2, l3))
+        pos_esperada = pos_num + 1
+        i += 3
     return indices_pos
 
 
