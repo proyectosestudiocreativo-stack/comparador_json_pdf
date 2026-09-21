@@ -575,6 +575,37 @@ def extraer_pedido_del_nombre(nombre_archivo):
     return m.group(1) if m else ""
 
 
+def leer_filas_excel(bytes_excel, n_columnas=7):
+    """
+    Devuelve las filas de la primera hoja como listas de n_columnas valores.
+    Los .xls antiguos (formato binario, empiezan por la firma OLE D0CF11E0) se leen con xlrd;
+    los .xlsx con openpyxl. Las celdas vacías se devuelven como None.
+    """
+    if bytes_excel[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1":
+        import xlrd
+        libro = xlrd.open_workbook(file_contents=bytes_excel)
+        hoja  = libro.sheet_by_index(0)
+        filas = []
+        for r in range(hoja.nrows):
+            vals = []
+            for c in range(n_columnas):
+                v = hoja.cell_value(r, c) if c < hoja.ncols else None
+                if v == "":
+                    v = None
+                # xlrd devuelve todos los números como float: una referencia "14" llegaría como 14.0
+                elif isinstance(v, float) and v.is_integer():
+                    v = int(v)
+                vals.append(v)
+            filas.append(vals)
+        return filas
+
+    import openpyxl
+    wb = openpyxl.load_workbook(BytesIO(bytes_excel), data_only=True)
+    # Tomamos la primera hoja (es lo único que trae el Excel observado)
+    ws = wb[wb.sheetnames[0]]
+    return [[ws.cell(r, c).value for c in range(1, n_columnas + 1)] for r in range(1, ws.max_row + 1)]
+
+
 def parsear_excel(bytes_excel, nombre_archivo):
     """
     Lee el Excel que entrega el sistema. Estructura observada:
@@ -588,17 +619,9 @@ def parsear_excel(bytes_excel, nombre_archivo):
     No tiene cabecera de tabla ni datos de cliente / pedido.
     El número de pedido se saca del nombre del archivo.
     """
-    import openpyxl
-    from io import BytesIO
-
-    wb = openpyxl.load_workbook(BytesIO(bytes_excel), data_only=True)
-    # Tomamos la primera hoja (es lo único que trae el Excel observado)
-    ws = wb[wb.sheetnames[0]]
-
     lineas = []
     contador_id = 0
-    for r in range(1, ws.max_row + 1):
-        vals = [ws.cell(r, c).value for c in range(1, 8)]
+    for vals in leer_filas_excel(bytes_excel):
         ref = vals[1]
         if ref is None or not str(ref).strip():
             continue
@@ -820,6 +843,27 @@ def _comparar_por_id_xls(xls_lineas, pdf_lineas):
         ud_pdf_str = str(int(ud_pdf)) if ud_pdf is not None and ud_pdf == int(ud_pdf) else (str(ud_pdf) if ud_pdf is not None else "—")
         imp_pdf_str = a_euro(imp_pdf) if imp_pdf is not None else "—"
 
+        importe_cero  = imp_pdf is not None and imp_pdf == 0
+        precio_u_cero = precio_u_pdf is not None and precio_u_pdf == 0
+
+        if importe_cero or precio_u_cero:
+            columnas_cero = " y ".join(c for c, es_cero in [("Importe PDF", importe_cero),
+                                                             ("Precio U. PDF", precio_u_cero)] if es_cero)
+            verbo = "son" if importe_cero and precio_u_cero else "es"
+            avisos.append({
+                "Campo": f"Importe cero en PDF — {ref}",
+                "JSON": precio_u_xls_str, "PDF": imp_pdf_str,
+                "Diferencia": "",
+                "Qué corregir": f"{columnas_cero} de {ref} {verbo} 0,00 € en el PDF. Revisar.",
+            })
+            diferencias.append({
+                "Gravedad": "🟡 Aviso", "Tipo": "Línea",
+                "Campo": "Importe cero en PDF", "Referencia": ref,
+                "Valor JSON": precio_u_xls_str, "Valor PDF": imp_pdf_str,
+                "Diferencia": "",
+                "Qué corregir": f"{columnas_cero} de {ref} {verbo} 0,00 € en el PDF.",
+            })
+
         filas_tabla.append({
             "Ref":              ref,
             "Nombre":           nombre,
@@ -827,8 +871,8 @@ def _comparar_por_id_xls(xls_lineas, pdf_lineas):
             "Tamaño PDF":       tam_pdf,
             "Precio U. Excel":  precio_u_xls_str + (" ⚠️" if precio_elevado else ""),
             "Ud. PDF":          ud_pdf_str,
-            "Importe PDF":      imp_pdf_str,
-            "Precio U. PDF":    precio_u_pdf_str,
+            "Importe PDF":      imp_pdf_str + (" ⚠️" if importe_cero else ""),
+            "Precio U. PDF":    precio_u_pdf_str + (" ⚠️" if precio_u_cero else ""),
             "Dif. precio":      dif_str,
             "Estado":           estado,
         })
@@ -1042,6 +1086,22 @@ def comparar_por_id(json_lineas, pdf_lineas):
                     "Qué corregir": f"Precio de línea distinto en {ref}.",
                 })
 
+            precio_p_cero = precio_p is not None and precio_p == 0
+            if precio_p_cero:
+                avisos.append({
+                    "Campo": f"Importe cero en PDF — {id_json} ({ref})",
+                    "JSON": precio_j_str, "PDF": precio_p_str,
+                    "Diferencia": "",
+                    "Qué corregir": f"El precio de línea de {ref} (id {id_json}) es 0,00 € en el PDF. Revisar.",
+                })
+                diferencias.append({
+                    "Gravedad": "🟡 Aviso", "Tipo": "ID",
+                    "Campo": "Importe cero en PDF", "Referencia": f"{id_json} / {ref}",
+                    "Valor JSON": precio_j_str, "Valor PDF": precio_p_str,
+                    "Diferencia": "",
+                    "Qué corregir": f"Precio de línea de {ref} es 0,00 € en el PDF.",
+                })
+
             filas_tabla.append({
                 "ID":            id_json,
                 "Referencia":    ref,
@@ -1051,7 +1111,7 @@ def comparar_por_id(json_lineas, pdf_lineas):
                 "Tamaño JSON":   tam_json,
                 "Tamaño PDF":    tam_pdf,
                 "Precio JSON":   precio_j_str + (" ⚠️" if precio_elevado else ""),
-                "Precio PDF":    precio_p_str,
+                "Precio PDF":    precio_p_str + (" ⚠️" if precio_p_cero else ""),
                 "Dif. precio":   dif_precio_str,
                 "Estado":        estado,
             })
@@ -1104,7 +1164,7 @@ def mostrar_resultado(pedido, cliente, json_resumen, pdf_resumen, diferencias, c
                                     (c6, "Total",   json_resumen["total"],   pdf_resumen["total"])]:
             fj = convertir_a_float(vj)
             fp = convertir_a_float(vp)
-            delta = round(fp - fj, 2) if fj and fp else None
+            delta = round(fp - fj, 2) if fj is not None and fp is not None else None
             col.metric(f"{campo} JSON", a_euro(fj), delta=f"{delta} €" if delta else None)
 
         if criticas:
@@ -1221,6 +1281,8 @@ if not modo_excel and json_files and pdf_files:
             data = json.load(f)
             resumen, lineas = parsear_json(data)
             if resumen["pedido"]:
+                if resumen["pedido"] in jsons:
+                    st.warning(f"⚠️ {f.name}: el pedido {resumen['pedido']} ya venía en otro JSON. Se usa este último.")
                 jsons[resumen["pedido"]] = (resumen, lineas)
             else:
                 st.warning(f"⚠️ {f.name} no tiene número de pedido.")
@@ -1237,6 +1299,8 @@ if not modo_excel and json_files and pdf_files:
             lineas   = parsear_lineas_pdf(texto, debug_log=debug_log)
             pedido   = cabecera["pedido"]
             if pedido:
+                if pedido in pdfs:
+                    st.warning(f"⚠️ {f.name}: el pedido {pedido} ya venía en otro PDF. Se usa este último.")
                 pdfs[pedido] = (
                     {
                         "pedido":  pedido,
@@ -1316,6 +1380,8 @@ if modo_excel and xls_files and pdf_files:
             resumen, lineas = parsear_excel(contenido, f.name)
             pedido = resumen["pedido"]
             if pedido:
+                if pedido in xls_dict:
+                    st.warning(f"⚠️ {f.name}: el pedido {pedido} ya venía en {xls_dict[pedido][2]}. Se usa este último.")
                 xls_dict[pedido] = (resumen, lineas, f.name)
             else:
                 st.warning(f"⚠️ **{f.name}** — no se ha detectado un número de pedido en el nombre del archivo. "
@@ -1334,6 +1400,8 @@ if modo_excel and xls_files and pdf_files:
             lineas   = parsear_lineas_pdf(texto, debug_log=debug_log)
             pedido   = cabecera["pedido"]
             if pedido:
+                if pedido in pdfs:
+                    st.warning(f"⚠️ {f.name}: el pedido {pedido} ya venía en otro PDF. Se usa este último.")
                 pdfs[pedido] = (
                     {
                         "pedido":  pedido,
